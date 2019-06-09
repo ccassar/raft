@@ -1,3 +1,5 @@
+[![GoDoc](https://godoc.org/github.com/ccassar/raft?status.svg)](https://godoc.org/github.com/ccassar/raft)
+
 # raft
 
 Yet another implementation of raft, in go.
