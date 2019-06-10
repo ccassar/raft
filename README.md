@@ -1,4 +1,5 @@
 [![GoDoc](https://godoc.org/github.com/ccassar/raft?status.svg)](https://godoc.org/github.com/ccassar/raft)
+[![Build Status](https://travis-ci.org/ccassar/raft.svg?branch=master)](https://travis-ci.org/ccassar/raft)
 
 # raft
 
