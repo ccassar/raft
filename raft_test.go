@@ -123,7 +123,7 @@ func TestMakeNode(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			nodes := []*Node{}
 
-			for i, _ := range tc.cfg {
+			for i := range tc.cfg {
 				wg.Add(1)
 				n, err := MakeNode(ctx, &wg, tc.cfg[i],
 					append(tc.opts, WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false))...)

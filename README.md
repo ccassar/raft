@@ -1,7 +1,7 @@
 [![GoDoc](https://godoc.org/github.com/ccassar/raft?status.svg)](https://godoc.org/github.com/ccassar/raft)
 [![Build Status](https://travis-ci.org/ccassar/raft.svg?branch=master)](https://travis-ci.org/ccassar/raft)
 [![codecov](https://codecov.io/gh/ccassar/raft/branch/master/graph/badge.svg)](https://codecov.io/gh/ccassar/raft)
-
+[![Go Report Card](https://goreportcard.com/badge/github.com/ccassar/raft)](https://goreportcard.com/report/github.com/ccassar/raft)
 
 # raft
 

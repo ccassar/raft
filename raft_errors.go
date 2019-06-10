@@ -29,8 +29,8 @@ import (
 //
 
 // Keyword for error field in logger...
-const rAFT_ERR_KEYWORD = "err"
-const rAFT_SENTINEL = "errCode: "
+const raftErrKeyword = "err"
+const raftSentinel = "errCode: "
 
 // Raft sentinel errors (as per https://dave.cheney.net/2016/04/07/constant-errors).
 type Error string
@@ -40,28 +40,28 @@ func (e Error) Error() string { return string(e) }
 // RaftErrorBadMakeNodeOption is returned (extracted using errors.Cause(err)) if options
 // provided at start up fail to apply. See ExampleMakeNode for an example of how to extract
 // and test against sentinel.
-const RaftErrorBadMakeNodeOption = Error(rAFT_SENTINEL + "bad MakeNode option")
+const RaftErrorBadMakeNodeOption = Error(raftSentinel + "bad MakeNode option")
 
 // RaftErrorServerNotSetup is the sentinel returned  (extracted using errors.Cause(err)) if
 // local address (server side) is not set up when expected. See ExampleMakeNode for an example of how to
 // extract and test against sentinel.
-const RaftErrorServerNotSetup = Error(rAFT_SENTINEL + "local server side not set up yet")
+const RaftErrorServerNotSetup = Error(raftSentinel + "local server side not set up yet")
 
 // RaftErrorClientConnectionUnrecoverable is the sentinel returned  (extracted using errors.Cause(err)) if
 // client gRPC connection to remote node failed. See ExampleMakeNode for an example of how to extract and test against
 // sentinel.
 const RaftErrorClientConnectionUnrecoverable = Error(
-	rAFT_SENTINEL + "gRPC client connection failed in an unrecoverable way. Check NodeConfig is correct.")
+	raftSentinel + "gRPC client connection failed in an unrecoverable way. Check NodeConfig is correct.")
 
 // RaftErrorMissingLogger is returned (extracted using errors.Cause(err)) if options
 // provided at start up fail to apply. See ExampleMakeNode for an example of how to extract
 // and test against sentinel.
-const RaftErrorMissingLogger = Error(rAFT_SENTINEL + "no logger setup")
+const RaftErrorMissingLogger = Error(raftSentinel + "no logger setup")
 
 // RaftErrorMissingNodeConfig is returned (extracted using errors.Cause(err)) if config options
 // provided at start are expected but missing. See ExampleMakeNode for an example of how to extract
 // and test against sentinel.
-const RaftErrorMissingNodeConfig = Error(rAFT_SENTINEL + "node config insufficient")
+const RaftErrorMissingNodeConfig = Error(raftSentinel + "node config insufficient")
 
 // raftErrorf is a simple wrapper which ensures that all raft errors are prefixed
 // consistently, and that we always either wrap a root cause error bubbling up from

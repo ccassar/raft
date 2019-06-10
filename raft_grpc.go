@@ -20,8 +20,8 @@ import (
 	"time"
 )
 
-const dEFAULT_INACTIVITY_TRIGGERED_PING_SECONDS = 10
-const dEFAULT_TIMEOUT_AFTER_PING_SECONDS = 10
+const defaultInactivityTriggeredPingSeconds = 10
+const defaultTimeoutAfterPingSeconds = 10
 
 // server implements the raft grpc service, server side.
 type raftServer struct {
@@ -88,8 +88,8 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	options := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(100), // aggressive max concurrent stream per transport
 		grpc.KeepaliveParams(keepalive.ServerParameters{ // similarly aggressive attempt to track connection liveness
-			Time:    time.Second * dEFAULT_INACTIVITY_TRIGGERED_PING_SECONDS, // 10 seconds with no activity, kick client for ping
-			Timeout: time.Second * dEFAULT_TIMEOUT_AFTER_PING_SECONDS,        // no ping after the next 10 seconds, then close connection.
+			Time:    time.Second * defaultInactivityTriggeredPingSeconds, // 10 seconds with no activity, kick client for ping
+			Timeout: time.Second * defaultTimeoutAfterPingSeconds,        // no ping after the next 10 seconds, then close connection.
 		}),
 		// control how often a client can send a keepalive, and whether to allow keepalives with no streams.
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
@@ -126,7 +126,8 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 			// We should not receive an error if we exited gracefully; i.e. context cancellation. If we exit in error,
 			// we restart the server, after a short wait (backoff may be useful here).
 			err := raftErrorf(err, "gRPC server stopped serving unexpectedly")
-			n.logger.Errorw("gRPC Server exit", append(s.logKV(), rAFT_ERR_KEYWORD, err)...)
+			n.logger.Errorw("gRPC Server exit", append(s.logKV(), raftErrKeyword, err)...)
+			// TODO Backoff...
 		} else {
 			// We're done...
 			break
@@ -162,7 +163,7 @@ func initServer(ctx context.Context, n *Node) error {
 	}
 
 	err := raftErrorf(errors.New(strings.Join(errs, ", ")), "failed to set up local TCP socket for gRPC")
-	n.logger.Errorw("listener failed to acquire node address", rAFT_ERR_KEYWORD, err)
+	n.logger.Errorw("listener failed to acquire node address", raftErrKeyword, err)
 
 	return err
 }
@@ -218,8 +219,8 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	// Prepend our options such that they can be overridden by the client options if they overlap.
 	options := []grpc.DialOption{
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:    time.Second * dEFAULT_INACTIVITY_TRIGGERED_PING_SECONDS,
-			Timeout: time.Second * dEFAULT_TIMEOUT_AFTER_PING_SECONDS,
+			Time:    time.Second * defaultInactivityTriggeredPingSeconds,
+			Timeout: time.Second * defaultTimeoutAfterPingSeconds,
 		}),
 		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(unaryInterceptorChain...))}
 
@@ -233,7 +234,7 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		if ctx.Err() == nil {
 			// This is not a shutdown. We have taken a fatal error (i.e. this is not a transient error). Possibly
 			// a misconfiguration of the options, for example. We will return a fatal error.
-			n.logger.Errorw("remote node client worker aborting", append(c.logKV(), rAFT_ERR_KEYWORD, err)...)
+			n.logger.Errorw("remote node client worker aborting", append(c.logKV(), raftErrKeyword, err)...)
 			n.signalFatalError(raftErrorf(
 				RaftErrorClientConnectionUnrecoverable, "grpc client connection to remote node, err [%v]", err))
 		}
@@ -271,7 +272,7 @@ func initClients(ctx context.Context, n *Node) error {
 	// it.
 	if n.messaging == nil || n.messaging.server.localAddr == "" {
 		err := raftErrorf(RaftErrorServerNotSetup, "failed to set up clients, local endpoint not identified yet")
-		n.logger.Errorw("server should be set up successfully prior to client setup", rAFT_ERR_KEYWORD, err)
+		n.logger.Errorw("server should be set up successfully prior to client setup", raftErrKeyword, err)
 		return err
 	}
 

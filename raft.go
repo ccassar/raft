@@ -51,18 +51,18 @@ func NewNodeConfig() NodeConfig {
 	return nc
 }
 
-const mIN_NODES_IN_CLUSTER = 3
+const minNodesInCluster = 3
 
 // NodeConfig.validate: provides validation function for the configuration presented by user. Defaults are also
 // set if necessary.
 func (cfg *NodeConfig) validate() error {
 
-	if len(cfg.Nodes) < mIN_NODES_IN_CLUSTER {
+	if len(cfg.Nodes) < minNodesInCluster {
 		return raftErrorf(
 			RaftErrorMissingNodeConfig,
 			"not enough endpoints specified in Nodes %s, expect at least %d "+
 				"e.g. 'n1.example.com:443','n3.example.com:443','n3.example.com:443'",
-			cfg.Nodes, mIN_NODES_IN_CLUSTER)
+			cfg.Nodes, minNodesInCluster)
 	}
 
 	if cfg.ClientDialOptionsFn == nil {
@@ -70,7 +70,7 @@ func (cfg *NodeConfig) validate() error {
 			RaftErrorMissingNodeConfig,
 			"no dial options method is provided in ClientDialOptionsFn, either TLS or grpc.WithInsecure() "+
 				"option must be provided. Raft does NOT default to insecure unless explicitly requested by application",
-			mIN_NODES_IN_CLUSTER)
+			minNodesInCluster)
 	}
 
 	if cfg.ChannelDepth.ClientEvents == 0 {
@@ -157,12 +157,12 @@ func (n *Node) signalFatalError(err error) {
 
 	select {
 	case n.fatalErrorFeedback <- err:
-		n.logger.Errorw("raft, signalling fatal error", rAFT_ERR_KEYWORD, err.Error())
+		n.logger.Errorw("raft, signalling fatal error", raftErrKeyword, err.Error())
 		n.cancel()
 	default:
 		// If pushing to fatalErrorFeedback would block, then we don't bother. Because we are using a buffered channel,
 		// if we get here it means that the channel is busy already - one fatal error is as good as many.
-		n.logger.Errorw("raft, skipped signalling fatal error, signalled already", rAFT_ERR_KEYWORD, err.Error())
+		n.logger.Errorw("raft, skipped signalling fatal error, signalled already", raftErrKeyword, err.Error())
 	}
 }
 
