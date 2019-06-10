@@ -32,7 +32,7 @@ import (
 const raftErrKeyword = "err"
 const raftSentinel = "errCode: "
 
-// Raft sentinel errors (as per https://dave.cheney.net/2016/04/07/constant-errors).
+// Error implements the error interface and represents sentinel errors for the raft package (as per https://dave.cheney.net/2016/04/07/constant-errors).
 type Error string
 
 func (e Error) Error() string { return string(e) }

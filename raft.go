@@ -209,7 +209,7 @@ func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
 	}
 }
 
-// Start raft node according to configuration provided.
+// MakeNode starts the raft node according to configuration provided.
 //
 // Node is returned, and public methods associated with Node can be used to interact with Node from multiple go
 // routines e.g. specifically in order to access the replicated log.
