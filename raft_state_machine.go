@@ -17,7 +17,7 @@ const (
 // Generic events... note how we carry *all* the context in the event; i.e. when we produce
 // an event we know all the context necessary to dispose of the event.
 type event interface {
-	handle()
+	handle(ctx context.Context)
 	// Used to generate consistent k/v for logging.
 	logKV() []interface{}
 }

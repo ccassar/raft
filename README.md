@@ -11,10 +11,11 @@ The focus of this implementation is an all-batteries-included, production qualit
 Intra-cluster connectivity is implemented over gRPC with support for TLS protection with mutual authentication.
 
 Observability is central to a production-quality implementation; structured logging (using Uber zap library)
-and metrics export (using prometheus library and gRPC interceptors) are an integral part of the implementation.
+and metrics export (using prometheus library and gRPC interceptors for both metrics and logging) are an integral
+part of the implementation.
 
-Unit test coverage is high and it is a goal to keep it so; unit test code itself is an integral component of the
-imeplementation.
+Unit test coverage is high and it is a goal to keep it so; unit test code itself is a key component of the
+implementation.
 
 
 ### Raft, The Consensus Algorithm
@@ -57,21 +58,22 @@ application. By default, the client and server are configured with aggressive ma
 and keepalive parameters and enforcement policy.
 
 Both the server side and client side are set up with prometheus and zap logging interceptors in order to
-provide consistent logging and metrics collection for gRPC calls. Note that logging filters out anything other
-than request vote RPCs to avoid the cost on the more common AppendEntry messages. A detailed configuration option
-in WithMetrics option under the control of the application determines whether we track the latency distribution
-of RPC calls.
+provide consistent logging and metrics collection for gRPC calls. Note that RPC logging filters out anything other
+than request vote RPCs to avoid the cost on the more common AppendEntry messages. A `detailed` configuration option
+[WithMetrics](https://godoc.org/github.com/ccassar/raft#WithLogger) under the control of the application determines 
+whether we track the latency distribution of RPC calls.
 
 #### TLS: Protecting Intracluster Messaging
 
 The Raft package supports protecting intra-cluster traffic with mutually authenticated TLS. Client dial
 options can be provided by the application as part of `MakeNode()` initialisation. These `grpc.DialOptions` are
-used by the local node when dialing into remote nodes. Godoc provides an example of how to run with TLS enabled.
+used by the local node when dialing into remote nodes. Godoc provides [an example](https://godoc.org/github.com/ccassar/raft#example-MakeNode--WithTLSConfiguration)
+of how to run with TLS enabled and with mutual authentication between server and client.
 
 ### Metrics
 
 The Raft package accepts a prometheus metrics registry and uses that to track key statistics of the Raft
- operation.
+ operation, including RPC metrics client and server side (using gRPC middleware interceptors).
 
 ### Logging
 
@@ -88,7 +90,7 @@ default, look like this:
 ```
 
 Raft logging is customisable in the MakeNode call, application controls logger through the WithLogging option.
-See godoc implementation and examples for details. WithLogger option allows app to disable logging, provide its
+See godoc [example for details](https://godoc.org/github.com/ccassar/raft#example-MakeNode--WithCustomisedLogLevel). WithLogger option allows app to disable logging, provide its
 own zap logger, or, in conjunction with DefaultZapLoggerConfig, to start with the default logging configuration
 in raft package, modify it based on application need, and activate it. 
 
@@ -99,11 +101,12 @@ clarify the circumstances leading to the error (in the usual form of a string re
 method on error). The same error can also be squeezed for a root cause using the errors.Cause()
 method. If the root cause is internal to raft, then the sentinel error will be one of those defined
 [here](raft_errors.go) and can be tested programmatically. If the root cause originated in some package
-downstream of raft, then the downstream error is propagated explicitly. Godoc documentation includes
-examples of how the errors can be handled programmatically. A quick example:
+downstream of raft, then the downstream error is propagated explicitly. Godoc documentation includes an
+[example](https://godoc.org/github.com/ccassar/raft#example-MakeNode) of how the errors can be handled 
+programmatically. In essence:
 
 ```
-	n, err := StartNode(ctx, &wg, cfg, WithLogger(mylog))
+	n, err := MakeNode(ctx, &wg, cfg, WithLogger(mylog))
 	if err != nil {
 
 		switch errors.Cause(err) {

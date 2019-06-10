@@ -5,13 +5,19 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/ccassar/raft/raft_pb"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	status2 "google.golang.org/grpc/status"
 	"io/ioutil"
+	"net/http"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -19,6 +25,31 @@ import (
 )
 
 func TestMakeNode(t *testing.T) {
+
+	// A neat property of the package is that it hunts for a node it can become - if cluster is made of of three
+	// nodes, node config does not explicitly say which node it is - instead, node simply hunts and tries to listen
+	// on any of the node sockets configured - if it succeeds, than it is the one. Identical configurations
+	// for Nodes can be passed in to all nodes; e.g. these three local instances fired up will between them settle
+	// in the role of one of the configured nodes.
+	nodeCfgs := []NodeConfig{{
+		Nodes: []string{":8088", ":8089", ":8090"},
+		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
+			return []grpc.DialOption{grpc.WithInsecure()}
+		}}, {
+		Nodes: []string{":8088", ":8089", ":8090"},
+		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
+			return []grpc.DialOption{grpc.WithInsecure()}
+		}}, {
+		Nodes: []string{":8088", ":8089", ":8090"},
+		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
+			return []grpc.DialOption{grpc.WithInsecure()}
+		}},
+	}
+
+	// Setup prometheus endpoint on default registry.
+	http.Handle("/metrics", promhttp.Handler())
+	promEndpoint := ":8000"
+	go http.ListenAndServe(promEndpoint, nil)
 
 	testCases := []struct {
 		name string
@@ -29,35 +60,14 @@ func TestMakeNode(t *testing.T) {
 	}{
 		{
 			"Cluster of three",
-			// A neat property of the package is that it hunts for a node it can be. This way, identical configurations
-			// for Nodes can be passed in, and the three local instances fired up will between them settle in the role
-			// of one of the configured nodes.
-			[]NodeConfig{{
-				Nodes: []string{":8088", ":8089", ":8090"},
-				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-					return []grpc.DialOption{grpc.WithInsecure()}
-				}}, {
-				Nodes: []string{":8088", ":8089", ":8090"},
-				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-					return []grpc.DialOption{grpc.WithInsecure()}
-				}}, {
-				Nodes: []string{":8088", ":8089", ":8090"},
-				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-					return []grpc.DialOption{grpc.WithInsecure()}
-				}},
-			},
+			nodeCfgs,
 			[]NodeOption{},
 			true,
 			evalConnectedClients,
 		},
 		{
 			"Exercise signalFatalError",
-			[]NodeConfig{{
-				Nodes: []string{":8088", ":8089", ":8090"},
-				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-					return []grpc.DialOption{grpc.WithInsecure()}
-				}},
-			},
+			nodeCfgs,
 			[]NodeOption{},
 			true,
 			func(ctx context.Context, nodes []*Node) error {
@@ -75,15 +85,24 @@ func TestMakeNode(t *testing.T) {
 				return nil
 			},
 		},
+		{
+			"Exercise WithMetrics option(default registry)",
+			nodeCfgs,
+			[]NodeOption{WithMetrics(nil, true)},
+			true,
+			evalForClientTimeout,
+		},
 	}
 
 	l := getTestLogger()
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+
 			var wg sync.WaitGroup
 			ctx, cancel := context.WithCancel(context.Background())
 			nodes := []*Node{}
+
 			for i, _ := range tc.cfg {
 				wg.Add(1)
 				n, err := MakeNode(ctx, &wg, tc.cfg[i],
@@ -93,10 +112,15 @@ func TestMakeNode(t *testing.T) {
 				}
 				nodes = append(nodes, n)
 			}
+
 			err := tc.eval(ctx, nodes)
 			if err != nil {
 				t.Error(err)
 			}
+
+			t.Log("Metrics from all node")
+			t.Log(testScrapeMetrics("http://:8000/metrics"))
+
 			cancel()
 			wg.Wait()
 		})
@@ -104,8 +128,8 @@ func TestMakeNode(t *testing.T) {
 }
 
 // Test mutual authentication between clients and servers. We set up three nodes, and a full mesh of mutually
-// authenticated TLS client to server sesssion. We use self signed certificates. Simply replace (or omit) RootCAs
-// for clients which are using certificates signed by a CA (if omited, OS configured CA would be used).
+// authenticated TLS client to server session. We use self signed certificates. Simply replace (or omit) RootCAs
+// for clients which are using certificates signed by a CA (if omitted, OS configured CA would be used).
 func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 
 	caPool, err := testLoadCertPool("test")
@@ -160,9 +184,16 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	nodes := []*Node{}
+	metricsReg := make([]*prometheus.Registry, len(nc.Nodes))
+	metricsServer := make([]*http.Server, len(nc.Nodes))
+
 	for i := 0; i < len(nc.Nodes); i++ {
+		metricsReg[i], metricsServer[i] = testSetupMetricsRegistryAndServer(
+			fmt.Sprintf(":%d", 8001+i), "/metrics")
 		wg.Add(1)
-		n, err := MakeNode(ctx, &wg, nc, WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), true))
+		n, err := MakeNode(ctx, &wg, nc,
+			WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false),
+			WithMetrics(metricsReg[i], true))
 
 		if err != nil {
 			t.Fatalf("%s, expected ok, got [%v]", t.Name(), err)
@@ -170,9 +201,15 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		nodes = append(nodes, n)
 	}
 
-	err = evalConnectedClients(ctx, nodes)
+	err = evalForClientTimeout(ctx, nodes)
 	if err != nil {
 		t.Error(err)
+	}
+
+	for i := 0; i < len(nc.Nodes); i++ {
+		t.Log("Metrics from node: ", nodes[i].logKV())
+		t.Log(testScrapeMetrics(fmt.Sprintf("http://:%d/metrics", 8001+i)))
+		metricsServer[i].Shutdown(ctx)
 	}
 
 	cancel()
@@ -227,7 +264,7 @@ func TestInitMessaging(t *testing.T) {
 	}
 
 	n := &Node{
-		messaging: &raftMessaging{grpcLogging: true},
+		messaging: &raftMessaging{grpcLogging: false},
 		logger:    l.Sugar(),
 		config: &NodeConfig{Nodes: []string{
 			"1.2.3.4:12345", // we expect this to not be picked because it is not local
@@ -344,13 +381,13 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 	}
 
 	wg.Add(1)
-	n, err := MakeNode(ctx, &wg, cfg, WithLogger(logger, true))
+	n, err := MakeNode(ctx, &wg, cfg, WithLogger(logger, false))
 	if err != nil {
 		/// handle error
 	}
 
 	//
-	// At any point, the logging level can be safely and concurrently, changed.
+	// At any point, the logging level can be safely and concurrently changed.
 	loggerCfg.Level.SetLevel(zapcore.InfoLevel)
 
 	fmt.Printf("node started with config [%v]", n.config)
@@ -387,29 +424,28 @@ func ExampleMakeNode_withTLSConfiguration() {
 
 	// We setup a configuration to enforce authenticating TLS client connecting to this node, and to validate
 	// server certificate in all client connections to remove cluster nodes.
-	nc := NodeConfig{
-		Nodes: []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
-		ClientDialOptionsFn: func(local, remote string) []grpc.DialOption {
-			tlsCfg := &tls.Config{
-				ServerName:   serverToName[remote],
-				Certificates: []tls.Certificate{localCert},
-				// If RootCAs is not set, host OS root CA set is used to validate server certificate.
-				// Alternatively, custom Cert CA pool to use to validate server certificate would be set up here.
-				RootCAs: certPool,
-			}
-			return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
-		},
-		ServerOptionsFn: func(local string) []grpc.ServerOption {
-			tlsCfg := &tls.Config{
-				ClientAuth:   tls.RequireAndVerifyClientCert,
-				Certificates: []tls.Certificate{localCert},
-				// If ClientCAs is not set, host OS root CA set is used to validate client certificate.
-				// Alternatively, custom Cert CA pool to use to validate server certificate would be set up here.
-				// ClientCAs pool does NOT need to be the same as RootCAs pool.
-				ClientCAs: certPool,
-			}
-			return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
-		},
+	nc := NewNodeConfig()
+	nc.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
+	nc.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+		tlsCfg := &tls.Config{
+			ServerName:   serverToName[remote],
+			Certificates: []tls.Certificate{localCert},
+			// If RootCAs is not set, host OS root CA set is used to validate server certificate.
+			// Alternatively, custom Cert CA pool to use to validate server certificate would be set up here.
+			RootCAs: certPool,
+		}
+		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
+	}
+	nc.ServerOptionsFn = func(local string) []grpc.ServerOption {
+		tlsCfg := &tls.Config{
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			Certificates: []tls.Certificate{localCert},
+			// If ClientCAs is not set, host OS root CA set is used to validate client certificate.
+			// Alternatively, custom Cert CA pool to use to validate server certificate would be set up here.
+			// ClientCAs pool does NOT need to be the same as RootCAs pool.
+			ClientCAs: certPool,
+		}
+		return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
 	}
 
 	var wg sync.WaitGroup
@@ -431,6 +467,67 @@ func ExampleMakeNode_withTLSConfiguration() {
 	cancel()
 	wg.Wait()
 
+}
+
+func ExampleMakeNode_withDefaultMetricsRegistry() {
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	l, err := DefaultZapLoggerConfig().Build()
+	if err != nil {
+		// handle err
+	}
+
+	cfg := NewNodeConfig()
+	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
+	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+		return []grpc.DialOption{grpc.WithInsecure()}
+	}
+
+	_, err = MakeNode(ctx, &wg, cfg,
+		WithMetrics(nil, true),
+		WithLogger(l, false))
+	if err != nil {
+		// handle error...
+	}
+
+	// Do remember to serve the metrics registered with the prometheus DefaultRegistry:
+	// e.g. as described here: https://godoc.org/github.com/prometheus/client_golang/prometheus
+
+	cancel()
+	wg.Wait()
+}
+
+func ExampleMakeNode_withDedicatedMetricsRegistry() {
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	l, err := DefaultZapLoggerConfig().Build()
+	if err != nil {
+		// handle err
+	}
+
+	cfg := NewNodeConfig()
+	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
+	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+		return []grpc.DialOption{grpc.WithInsecure()}
+	}
+
+	myregistry := prometheus.NewRegistry()
+	// Do remember to serve metrics by setting up the server which serves the prometheus handler
+	// obtained by handler := promhttp.HandlerFor(myregistry, promhttp.HandlerOpts{})
+
+	_, err = MakeNode(ctx, &wg, cfg,
+		WithMetrics(myregistry, true),
+		WithLogger(l, false))
+	if err != nil {
+		/// handle error
+	}
+
+	cancel()
+	wg.Wait()
 }
 
 func getTestLogger() *zap.Logger {
@@ -469,13 +566,55 @@ func testLoadCertPool(dir string) (*x509.CertPool, error) {
 	return certPool, nil
 }
 
+type testEventRequestVote struct {
+	request  *raft_pb.RequestVoteRequest
+	response *raft_pb.RequestVoteReply
+	err      error
+	client   *raftClient
+	wg       *sync.WaitGroup
+}
+
+func (t *testEventRequestVote) handle(ctx context.Context) {
+	callCtx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
+	t.response, t.err = t.client.grpcClient.RequestVote(callCtx, t.request)
+	t.wg.Done()
+}
+
+func (t *testEventRequestVote) logKV() []interface{} {
+	return append(t.client.logKV(), "request", *t.request)
+}
+
+func evalForClientTimeout(ctx context.Context, nodes []*Node) error {
+
+	for _, n := range nodes {
+		for _, cl := range n.messaging.clients {
+			e := testEventRequestVote{client: cl, wg: new(sync.WaitGroup), request: &raft_pb.RequestVoteRequest{}}
+			e.wg.Add(1)
+			// deadline will ensure it does not block forever.
+			cl.eventChannel <- &e
+			e.wg.Wait()
+			if e.err != nil {
+				// expect error other than timeout.
+				st, ok := status2.FromError(e.err)
+				if ok {
+					if st.Code() == codes.DeadlineExceeded {
+						return fmt.Errorf("RequestVort to %s returned deadline exceeded", cl.remoteAddress)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 type testEvent struct {
 	name  string
 	count *atomic.Int32
 	wg    *sync.WaitGroup
 }
 
-func (t *testEvent) handle() {
+func (t *testEvent) handle(ctx context.Context) {
 	t.count.Inc()
 	t.wg.Done()
 }
@@ -521,4 +660,36 @@ func evalConnectedClients(ctx context.Context, nodes []*Node) error {
 		}
 	}
 	return nil
+}
+
+func testScrapeMetrics(url string) string {
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Sprint("FAILED TO SCRAPE METRICS", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+
+	if err != nil {
+		return fmt.Sprint("FAILED TO SCRAPE METRICS", url, err)
+	}
+	return string(body)
+}
+
+func testSetupMetricsRegistryAndServer(endpoint, path string) (*prometheus.Registry, *http.Server) {
+
+	// Setup prometheus endpoint on default registry.
+	metricsReg := prometheus.NewRegistry()
+	handler := promhttp.HandlerFor(metricsReg, promhttp.HandlerOpts{})
+
+	handlerMux := http.NewServeMux()
+	handlerMux.Handle(path, handler)
+	metricServer := &http.Server{
+		Addr:    endpoint,
+		Handler: handlerMux,
+	}
+	go metricServer.ListenAndServe()
+
+	return metricsReg, metricServer
 }

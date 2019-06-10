@@ -86,7 +86,7 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	// are aggressive and assume good connectivity between cluster nodes. These options can be overridden
 	// in MakeNode configuration.
 	options := []grpc.ServerOption{
-		grpc.MaxConcurrentStreams(1), // really aggressive max concurrent stream per transport, just the one!
+		grpc.MaxConcurrentStreams(100), // aggressive max concurrent stream per transport
 		grpc.KeepaliveParams(keepalive.ServerParameters{ // similarly aggressive attempt to track connection liveness
 			Time:    time.Second * dEFAULT_INACTIVITY_TRIGGERED_PING_SECONDS, // 10 seconds with no activity, kick client for ping
 			Timeout: time.Second * dEFAULT_TIMEOUT_AFTER_PING_SECONDS,        // no ping after the next 10 seconds, then close connection.
@@ -120,14 +120,17 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		}
 	}()
 
-	err := s.grpcServer.Serve(s.localListener)
-	if err != nil {
-		// We should not receive an error if we exited gracefully; i.e. context cancellation. If we exit in error,
-		// we log and signal the need to restart and exit and let orchestrator operator deal with whatever unexpected
-		// scenarion did this.
-		err := raftErrorf(err, "gRPC server stopped serving unexpectedly")
-		n.signalFatalError(err)
-		n.logger.Errorw("gRPC Server exit", append(s.logKV(), rAFT_ERR_KEYWORD, err)...)
+	for {
+		err := s.grpcServer.Serve(s.localListener)
+		if err != nil {
+			// We should not receive an error if we exited gracefully; i.e. context cancellation. If we exit in error,
+			// we restart the server, after a short wait (backoff may be useful here).
+			err := raftErrorf(err, "gRPC server stopped serving unexpectedly")
+			n.logger.Errorw("gRPC Server exit", append(s.logKV(), rAFT_ERR_KEYWORD, err)...)
+		} else {
+			// We're done...
+			break
+		}
 	}
 	n.logger.Infow("gRPCServer shut down gracefully", s.logKV()...)
 }
@@ -188,21 +191,12 @@ func (c *raftClient) logKV() []interface{} {
 	return []interface{}{"obj", "remoteNode", "nodeIndex", c.index, "address", c.remoteAddress}
 }
 
-func helperWait(ctx context.Context, delay time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(delay):
-	}
-	return true
-}
-
 // raftClient.run is a per remote node goroutine which will maintain a gRPC client connection to the remote node,
 // posts to the main state machine.
 func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	defer wg.Done()
 
-	n.logger.Infow("remote node client worker starting up", c.logKV()...)
+	n.logger.Infow("remote node client worker start running", c.logKV()...)
 
 	// Add grpc client interceptor for logging, and metrics collection (if enabled).
 
@@ -223,7 +217,6 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	// Prepend our options such that they can be overridden by the client options if they overlap.
 	options := []grpc.DialOption{
-		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    time.Second * dEFAULT_INACTIVITY_TRIGGERED_PING_SECONDS,
 			Timeout: time.Second * dEFAULT_TIMEOUT_AFTER_PING_SECONDS,
@@ -261,7 +254,7 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 			// feedback based on the outcome of the event. (The handler must also manage counting).
 			// (Logging is a bit expensive, but nice and consistent!)
 			n.logger.Debugw("client, dispatch event", append(c.logKV(), e.logKV()...)...)
-			e.handle()
+			e.handle(ctx)
 
 		case <-ctx.Done():
 			// We're done. By this point we will have cleaned up and we're ready to go.

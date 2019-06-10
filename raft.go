@@ -43,7 +43,7 @@ type NodeConfig struct {
 }
 
 // NewNodeConfig returns a NodeConfig structure initialised with sensible defaults where possible. Caller,
-// will need to setup Nodes as minimum before using NodeConfig in MakeNode.
+// will need to setup Nodes as a minimum before using NodeConfig in MakeNode.
 func NewNodeConfig() NodeConfig {
 
 	nc := NodeConfig{}
@@ -127,11 +127,26 @@ type Node struct {
 	logger *zap.SugaredLogger
 }
 
-// FatalErrorChannel returns the an error channel which is used by the raft Node to signal an unrecoverable failure.
-// This channel is used to flag a fatal error which the user can react to. The node would have progressed and shutdown,
-// but the application, should it choose to shutdown, should exit as usual (i.e. cancel, wait on wait group etc).
+// FatalErrorChannel returns an error channel which is used by the raft Node to signal an unrecoverable failure
+// asynchronously to the application. Such errors are expected to occur with vanishingly small probability.
+// An example of such an error would be if the dial options or gRPC server options provided make it impossible
+// for the client to successfully connect with the server (RaftErrorClientConnectionUnrecoverable). When a fatal
+// error is registered, raft package will stop operating, and will mark the root wait group done.
 func (n *Node) FatalErrorChannel() chan error {
 	return n.fatalErrorFeedback
+}
+
+func (n *Node) logKV() []interface{} {
+
+	kv := []interface{}{"obj", "Node"}
+
+	if n.messaging.server != nil {
+		kv = append(kv, n.messaging.server.logKV()...)
+	}
+
+	kv = append(kv, "clients", len(n.messaging.clients), "fatalErrorCount", n.fatalErrorCount.Load())
+
+	return kv
 }
 
 // signalFatalError allows package to indicate fatal error to user. This will typically be followed by the client
@@ -154,16 +169,20 @@ func (n *Node) signalFatalError(err error) {
 // NodeOption operator, operates on node to manage configuration.
 type NodeOption func(*Node) error
 
-// WithLogger option can be used to provide a customised zap logger, or to disable logging.
-// WithLogger option used as MakeNode option to specify logging against a logger which is already setup
-// to match host logging policy. If logger passed in is nil, raft will disable logging.
-// If WithLogger option is not specified, raft uses its own configured zap logger. Finally, if application
-// wishes to derived its logger as some variation of the default raft logger, application can access
-// DefaultZapLoggerConfig() to fetch a default logger, derive a new logger using zap WithOption function,
-// and pass the newly derived logger into WithLogger. An example of exactly this usecase to change level
-// is available in the godoc examples.
+// WithLogger option is invoked by the application to provide a customised zap logger option, or to disable logging.
+// The NodeOption returned by WithLogger is passed in to MakeNode to control logging; e.g. to provide a preconfigured
+// application logger. If logger passed in is nil, raft will disable logging.
 //
-// grpcLogs controls whether raft package redirects underlying gprc middleware logging to zap log. This is noisy.
+// If WithLogger generated NodeOption is not passed in, package uses its own configured zap logger.
+//
+// Finally, if application wishes to derive its logger as some variant of the default raft logger, application can invoke
+// DefaultZapLoggerConfig() to fetch a default logger configuration. It can use that configuration (modified as necessary)
+// to build a new logger directly through zap library. That new logger can then be passed into WithLogger to generate
+// the appropriate node option. An example of exactly this use case is available in the godoc examples. In the example,
+// the logger configuration is set up to allow for on-the-fly changes to logging level.
+//
+// grpcLogs controls whether raft package redirects underlying gprc middleware logging to zap log. This is noisy, and
+// unless in depth gRPC troubleshooting is required, grpcLogToZap should be set to false.
 func WithLogger(logger *zap.Logger, grpcLogToZap bool) NodeOption {
 	return func(n *Node) error {
 		if logger != nil {
@@ -178,9 +197,11 @@ func WithLogger(logger *zap.Logger, grpcLogToZap bool) NodeOption {
 }
 
 // WithMetrics option used with MakeNode to specify metrics registry we should count in. Detailed
-// option indicates whether detailed (more expensive) metrics are tracked (e.g. grpc latency distribution).
-// (If nil is passed in the default registry prometheus.DefaultRegisterer is used. Do note that the package
-// does not setup serving metrics; that is up to the application.)
+// option indicates whether detailed (and more expensive) metrics are tracked (e.g. grpc latency distribution).
+// If nil is passed in for the registry, the default registry prometheus.DefaultRegisterer is used. Do note that
+// the package does not setup serving metrics; that is up to the application. The examples in godoc show how to
+// setup a custom metrics registry to log against. If the WithMetrics NodeOption is passed in to MakeNode, metrics
+// collection is disabled.
 func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
 	return func(n *Node) error {
 		n.metrics = initMetrics(registry, detailed)
@@ -193,27 +214,29 @@ func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
 // Node is returned, and public methods associated with Node can be used to interact with Node from multiple go
 // routines e.g. specifically in order to access the replicated log.
 //
-// Context will be used to signal exit. WaitGroup wg should have 1 added to it prior to calling MakeNode and
-// should be waited on by the caller before exiting following a ctx.Close(). If MakeNode returns an error, WaitGroup
-// will be marked Done() correctly.
+// Context can be cancelled to signal exit. WaitGroup wg should have 1 added to it prior to calling MakeNode and
+// should be waited on by the caller before exiting following cancellation. Whether MakeNode returns successfully ot
+// not, WaitGroup will be marked Done() by the time the Node has cleaned up.
 //
 // If MakeNode returns without error, than over its lifetime it will be striving to maintain
 // the node as a raft member in the raft cluster, and maintaining its replica of the replicated
-// log. If a fatal error is encountered this will be signalled over the fatalError channel.
+// log.
 //
-// fatalError: A buffered channel of errors is provided to allow for raft package to signal fatal errors
+// If a fatal error is encountered this will be signalled over the fatalError channel.
+// A buffered channel of errors is provided to allow for raft package to signal fatal errors
 // upstream and allow client to determine best course of action; typically close context to shutdown.
-// Even in the case of a close of context (shutdown) following receipt of a fatal error, caller should
-// wait for wait group before exiting.
+// As in the normal shutdown case, following receipt of a fatal error, caller should cancel context and wait
+// for wait group before exiting. FatalErrorChannel method on the returned Node returns the error channel the
+// application should consume.
 //
-// Function also receives top level log, and metrics hook option.
+// MakeNode also accepts logging and metrics options (see WithMetrics and WithLogger).
 //
 // For logging, we would like to support structured logging. This makes specifying a useful
-// logger interface a little messier. Instead we use Uber zap, and allow user to
+// logger interface a little messier. Instead we depend on Uber zap and its interface, but allow user to
 // either provide a configured zap logger of its own, allow raft to use its default logging setup,
 // or disable logging altogether. Customisation is achieved through the WithLogging option.
 //
-// For metrics, raft library tries to adhere to the USE method as described here:
+// For metrics, raft package tries to adhere to the USE method as described here:
 // (http://www.brendangregg.com/usemethod.html) - in summary 'For every resource, track  utilization, saturation
 // and errors.'. On top of that we expect to be handed a metrics registry, and if one is provided, then we register
 // our metrics against that. Metrics registry and customisation can be provided through the WithMetrics option.
@@ -235,7 +258,7 @@ func MakeNode(
 
 	n := &Node{
 		messaging: &raftMessaging{},
-		// a single fatal error is sufficient to do the job. Create buffered channel of 1. This matters,
+		// A single fatal error is sufficient to do the job. Create buffered channel of 1. This matters,
 		// because when we signal, where we to block, we would skip enqueuing signal on the basis we know at
 		// least one signal is pending. And one signal would be enough.
 		fatalErrorFeedback: make(chan error, 1),
