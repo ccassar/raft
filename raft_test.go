@@ -59,6 +59,26 @@ func TestMakeNode(t *testing.T) {
 		eval func(ctx context.Context, nodes []*Node) error
 	}{
 		{
+			"NEGATIVE Cluster of two",
+			[]NodeConfig{{
+				Nodes: []string{":8088", ":8089"},
+				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
+					return []grpc.DialOption{grpc.WithInsecure()}
+				}}},
+			[]NodeOption{},
+			false,
+			func(ctx context.Context, nodes []*Node) error { return nil },
+		},
+		{
+			"NEGATIVE Node Config Missing Explicit Security Option",
+			[]NodeConfig{{
+				Nodes:               []string{":8088", ":8089", ":8090"},
+				ClientDialOptionsFn: nil}},
+			[]NodeOption{},
+			false,
+			func(ctx context.Context, nodes []*Node) error { return nil },
+		},
+		{
 			"Cluster of three",
 			nodeCfgs,
 			[]NodeOption{},
@@ -118,8 +138,10 @@ func TestMakeNode(t *testing.T) {
 				t.Error(err)
 			}
 
-			t.Log("Metrics from all node")
-			t.Log(testScrapeMetrics("http://:8000/metrics"))
+			if tc.ok { // no point scraping metrics if we do not expect MakeNode to succeed.
+				t.Log("Metrics from all node")
+				t.Log(testScrapeMetrics("http://:8000/metrics"))
+			}
 
 			cancel()
 			wg.Wait()
@@ -159,24 +181,23 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		":8082": "server2",
 	}
 
-	nc := NodeConfig{
-		Nodes: []string{":8080", ":8081", ":8082"},
-		ClientDialOptionsFn: func(local, remote string) []grpc.DialOption {
-			tlsCfg := &tls.Config{
-				ServerName:   serverToName[remote],                   // server name,
-				Certificates: []tls.Certificate{serverToCert[local]}, // client cert
-				RootCAs:      caPool,
-			}
-			return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
-		},
-		ServerOptionsFn: func(local string) []grpc.ServerOption {
-			tlsCfg := &tls.Config{
-				ClientAuth:   tls.RequireAndVerifyClientCert,
-				Certificates: []tls.Certificate{serverToCert[local]},
-				ClientCAs:    caPool,
-			}
-			return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
-		},
+	nc := NewNodeConfig()
+	nc.Nodes = []string{":8080", ":8081", ":8082"}
+	nc.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+		tlsCfg := &tls.Config{
+			ServerName:   serverToName[remote],                   // server name,
+			Certificates: []tls.Certificate{serverToCert[local]}, // client cert
+			RootCAs:      caPool,
+		}
+		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
+	}
+	nc.ServerOptionsFn = func(local string) []grpc.ServerOption {
+		tlsCfg := &tls.Config{
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			Certificates: []tls.Certificate{serverToCert[local]},
+			ClientCAs:    caPool,
+		}
+		return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
 	}
 
 	l := getTestLogger()
@@ -264,12 +285,21 @@ func TestInitMessaging(t *testing.T) {
 	}
 
 	n := &Node{
-		messaging: &raftMessaging{grpcLogging: false},
-		logger:    l.Sugar(),
+		logger: l.Sugar(),
 		config: &NodeConfig{Nodes: []string{
 			"1.2.3.4:12345", // we expect this to not be picked because it is not local
 			":8989",         // we expect this to be picked because it is local
 		}}}
+
+	err = initClients(nil, n)
+	if err == nil {
+		t.Errorf("expected initClient on %s nodes to fail", n.config.Nodes[0])
+	} else if errors.Cause(err) != RaftErrorServerNotSetup {
+		t.Errorf("expected initClient on %s nodes to fail with %v, got %v",
+			n.config.Nodes[0], RaftErrorServerNotSetup, err)
+	}
+
+	n.messaging = &raftMessaging{grpcLogging: false}
 	err = initMessaging(nil, n)
 	if err != nil {
 		t.Errorf("expected socket on %s to open, but failed [%v]",
@@ -666,13 +696,13 @@ func testScrapeMetrics(url string) string {
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Sprint("FAILED TO SCRAPE METRICS", url, err)
+		return fmt.Sprint("FAILED TO SCRAPE METRICS ", url, err)
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 
 	if err != nil {
-		return fmt.Sprint("FAILED TO SCRAPE METRICS", url, err)
+		return fmt.Sprint("FAILED TO SCRAPE METRICS ", url, err)
 	}
 	return string(body)
 }
