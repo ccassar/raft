@@ -89,6 +89,21 @@ func (s *raftServer) RequestTimeout(ctx context.Context, request *raft_pb.Reques
 	}
 }
 
+func (s *raftServer) LogCommand(ctx context.Context, request *raft_pb.LogCommandRequest) (*raft_pb.LogCommandReply, error) {
+	container := &logCommandContainer{request: request, returnChan: make(chan *logCommandContainer, 1)}
+	select {
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+	case s.node.engine.inboundLogCommandChan <- container:
+		select {
+		case replyContainer := <-container.returnChan:
+			return replyContainer.reply, replyContainer.err
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+		}
+	}
+}
+
 // raftServer.ApplicationLoopback is used exclusively in unit test.
 func (s *raftServer) ApplicationLoopback(ctx context.Context, in *raft_pb.AppNonce) (*raft_pb.AppNonce, error) {
 	return in, nil
