@@ -30,7 +30,8 @@ registered against the default prometheus registry would look like this:
  // Explicitly request insecure intra-cluster communication. It is not provided as default.
  cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption { return []grpc.DialOption{grpc.WithInsecure()} }
 
- node, err := MakeNode(ctx, &wg, cfg, WithMetrics(nil, true))
+ // 2 suggests we are running node3.example.com.
+ node, err := MakeNode(ctx, &wg, cfg, 2, WithMetrics(nil, true))
  if err != nil {
 	// Handle unrecoverable error
  }
@@ -38,7 +39,7 @@ registered against the default prometheus registry would look like this:
  //
  // At this point we're all set up. We can go about our business. We also want to learn about and handle any
  // underlying unrecoverable failures. (This probability of such errors is expected to be vanishingly small).
- raftUnrecoverableError := n.FatalErrorChannel()
+ raftUnrecoverableError := node.FatalErrorChannel()
  select {
 	// ...
 	case err := <- raftUnrecoverableError:
@@ -46,7 +47,7 @@ registered against the default prometheus registry would look like this:
  }
 
  //
- // When we are done with the local node, we can shut it down, and wait until it cleans up. This sequence
+ // When we are done with the local node, we can shut it down, and wait until it cleans up. This commitIndex
  // can be followed irrespective of whether raft returned an error from MakeNode, asynchronously via the fatal
  // error channel, or no errors at all.
  cancel()

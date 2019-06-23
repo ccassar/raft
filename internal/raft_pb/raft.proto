@@ -1,0 +1,77 @@
+syntax="proto3";
+
+package raft_pb;
+
+// RequestVoteRequest are initiated by node in Candidate state, on election.
+// Fields matched to condensed summary of Raft consensus algorithm in ISUCA.
+message RequestVoteRequest {
+    int64 term = 1;
+    int32 candidate_id = 2;
+    int64 last_log_index = 3;
+    int64 last_log_term = 4;
+    // Index indicating voterId we are requesting from, for diagnostics.
+    int32 To = 5;
+}
+
+message RequestVoteReply {
+    int64 term = 1;
+    int32 voter_id = 2;
+    bool vote_granted = 3;
+}
+
+// AppendEntryRequest are initiated by Leader nodes to request replication of log.
+// AppendEntryRequest with no log entries are sent by Leader as keepalives,
+// to stave off elections, and to convey highest committed sequence. The content
+// matches precisely the content specified in Figure 2 of ISUCA (see README.md).
+message AppendEntryRequest {
+    int64 term = 1;
+    int32 leader_id = 2;
+    int64 prev_log_index = 3;
+    int64 prev_log_term = 4;
+    int64 committed_index = 5;
+    repeated LogEntry log_entry = 6;
+    // diagnostics only, to points at destination message is being sent to.
+    int32 to = 7;
+}
+
+message AppendEntryReply {
+    int64 term = 1;
+    bool ack = 2;
+}
+
+// TimeoutNowRequest
+message RequestTimeoutRequest {
+}
+
+message RequestTimeoutReply {
+}
+
+// AppNonce, a test message used in unit test which can be safely ignored.
+message AppNonce {
+    int64 nonce = 1;
+}
+
+// Error handling as recommended here:
+// https://cloud.google.com/apis/design/errors#error_model
+
+service RaftService {
+    rpc AppendEntry(AppendEntryRequest) returns (AppendEntryReply);
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
+    rpc RequestTimeout(RequestTimeoutRequest) returns (RequestTimeoutReply);
+    rpc ApplicationLoopback(AppNonce) returns (AppNonce);
+}
+
+
+//
+// Serialised persisted state for all nodes.
+message PersistedState {
+    int32 voted_for = 1;
+    int64 current_term = 2;
+}
+
+// Serialised Log Entries
+message LogEntry {
+    int64 term = 1;
+    int64 sequence = 2;
+    bytes data = 3;
+}

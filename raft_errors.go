@@ -42,6 +42,11 @@ func (e Error) Error() string { return string(e) }
 // and test against sentinel.
 const RaftErrorBadMakeNodeOption = Error(raftSentinel + "bad MakeNode option")
 
+// RaftErrorBadLocalNodeIndex is returned (extracted using errors.Cause(err)) if localNodeIndex
+// provided is incorrect - typically out-of-bounds of Nodes in cluster. See ExampleMakeNode for an
+// example of how to extract and test against sentinel.
+const RaftErrorBadLocalNodeIndex = Error(raftSentinel + "bad localNodeIndex option")
+
 // RaftErrorServerNotSetup is the sentinel returned  (extracted using errors.Cause(err)) if
 // local address (server side) is not set up when expected. See ExampleMakeNode for an example of how to
 // extract and test against sentinel.
@@ -58,10 +63,19 @@ const RaftErrorClientConnectionUnrecoverable = Error(
 // and test against sentinel.
 const RaftErrorMissingLogger = Error(raftSentinel + "no logger setup")
 
-// RaftErrorMissingNodeConfig is returned (extracted using errors.Cause(err)) if config options
+// RaftErrorMissingNodeConfig is returned (extracted using errors.Cause(err)) if NodeConfig options
 // provided at start are expected but missing. See ExampleMakeNode for an example of how to extract
 // and test against sentinel.
 const RaftErrorMissingNodeConfig = Error(raftSentinel + "node config insufficient")
+
+// RaftErrorOutOfBoundsClient is returned (extracted using errors.Cause(err)) if logic produces a client
+// index for a client which does not exists. See ExampleMakeNode for an example of how to extract
+// and test against sentinel.
+const RaftErrorOutOfBoundsClient = Error(raftSentinel + "node index outside bounds of known clients")
+
+// RaftErrorNodePersistentData is returned (extracted using errors.Cause(err)) if we fail a bolt operation on the
+// persistent node data in BoltDB. See ExampleMakeNode for an example of how to extract and test against sentinel.
+const RaftErrorNodePersistentData = Error(raftSentinel + "node persistent data failed")
 
 // raftErrorf is a simple wrapper which ensures that all raft errors are prefixed
 // consistently, and that we always either wrap a root cause error bubbling up from

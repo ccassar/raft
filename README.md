@@ -109,7 +109,7 @@ downstream of raft, then the downstream error is propagated explicitly. Godoc do
 programmatically. In essence:
 
 ```
-	n, err := MakeNode(ctx, &wg, cfg, WithLogger(mylog))
+	n, err := MakeNode(ctx, &wg, cfg, localNodeIndex, WithLogger(mylog))
 	if err != nil {
 
 		switch errors.Cause(err) {
@@ -149,3 +149,29 @@ Other than the usual dependencies (i.e. go installation), protoc needs to be ins
 and the directory hosting protoc should be in the PATH. Running `go generate` will automatically regenerate 
 generated source.
 
+
+### Raw Design Notes
+
+ASIDE; the choice of term 'client' can lead to confusion - almost invariably client is
+referring to the gRPC client functionality which a Node uses to interact with other nodes'
+servers in the cluster. The term 'application' is used to refer to the entity reading and consuming
+log updates. In the raft specifications, 'application' is called client.
+ 
+From raftEngine to gRPC client goroutines, we never block with out timeout. This constraint should always be satisfied
+because this is what ensures that we never livelock with client goroutine pushing to raftEngine, and raftEngine
+trying to push to raftEngine. 
+
+#### Concurrency and Synchronisation
+
+The package uses multiple goroutines;
+ - a group of go routines offload communication to other cluster nodes (local node acting as a gRPC client to each
+ of the other nodes in the cluster). A goroutine fed through a buffered channel receives messages which need to be
+ communicated to the remote node. The goroutine handles the call and blocks waiting for response, and on receipt,
+ delivers the response back to the raft engine thread.
+ - the central goroutine handles the raft state machine. Messages received from other goroutines and timer events are
+ the main inputs to the state machine.
+ - An application facing goroutine is responsible for feeding the channel of 'applied' log entries to the application.
+  
+Synchronisation is lock free and largely message passing based. Other synchronisation primitives used include atomic
+updates to track when channels between raft engine and gRPC client goroutines should be flushed. 
+ 
