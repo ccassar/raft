@@ -21,14 +21,14 @@ func TestLogDBBasicOperations(t *testing.T) {
 		config: &NodeConfig{
 			LogDB:   "test/boltdb.mydb",
 			LogCmds: make(chan []byte)}}
-	re := raftEngine{node: n}
 
-	t.Log("Initialise persistent raft log")
-	err := re.initLogDB(ctx, n)
+	t.Log("Initialise persistent raft engine")
+	err := initRaftEngine(ctx, n)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	re := n.engine
 	if re.logDB == nil {
 		t.Fatal("Test failed to create logDB")
 	}
