@@ -39,11 +39,18 @@ message AppendEntryReply {
     bool ack = 2;
 }
 
-// TimeoutNowRequest
 message RequestTimeoutRequest {
 }
 
 message RequestTimeoutReply {
+}
+
+message LogCommandRequest {
+    bytes command = 1;
+}
+
+message LogCommandReply {
+    bool ack = 1;
 }
 
 // AppNonce, a test message used in unit test which can be safely ignored.
@@ -58,6 +65,7 @@ service RaftService {
     rpc AppendEntry(AppendEntryRequest) returns (AppendEntryReply);
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
     rpc RequestTimeout(RequestTimeoutRequest) returns (RequestTimeoutReply);
+    rpc LogCommand(LogCommandRequest)returns (LogCommandReply);
     rpc ApplicationLoopback(AppNonce) returns (AppNonce);
 }
 

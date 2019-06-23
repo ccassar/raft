@@ -44,9 +44,9 @@ registered against the default prometheus registry would look like this:
  raftUnrecoverableError := node.FatalErrorChannel()
  select {
     case logCmd := <- cfg.LogCmds:
-      // Handle committed distributed log commands
-	case err := <- raftUnrecoverableError:
-	  // Raft took some underlying error. Handle as appropriate (fail to orchestrator, restart, etc).
+    // Handle committed distributed log commands
+    case err := <- raftUnrecoverableError:
+    // Raft took some underlying error. Handle as appropriate (fail to orchestrator, restart, etc).
  }
 
  //

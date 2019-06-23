@@ -77,6 +77,10 @@ const RaftErrorOutOfBoundsClient = Error(raftSentinel + "node index outside boun
 // persistent node data in BoltDB. See ExampleMakeNode for an example of how to extract and test against sentinel.
 const RaftErrorNodePersistentData = Error(raftSentinel + "node persistent data failed")
 
+// RaftErrorLogCommandRejected is returned (extracted using errors.Cause(err)) if we fail to commit a log command
+// requested by the application. See ExampleMakeNode for an example of how to extract and test against sentinel.
+const RaftErrorLogCommandRejected = Error(raftSentinel + "log command failed to commit")
+
 // raftErrorf is a simple wrapper which ensures that all raft errors are prefixed
 // consistently, and that we always either wrap a root cause error bubbling up from
 // packages beneath raft, or a sentinel error from above.

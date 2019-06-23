@@ -69,13 +69,21 @@ type raftEngine struct {
 	//
 	inboundAppendEntryChan    chan *appendEntryContainer
 	inboundRequestVoteChan    chan *requestVoteContainer
+	inboundLogCommandChan     chan *logCommandContainer
 	inboundRequestTimeoutChan chan *requestTimeoutContainer
 	// The returns channels are used to return results asynchronously from the gRPC client goroutines.
-	returnsAppendEntryChan chan *appendEntryContainer
-	returnsRequestVoteChan chan *requestVoteContainer
+	returnsAppendEntryChan    chan *appendEntryContainer
+	returnsRequestVoteChan    chan *requestVoteContainer
+	returnsLogCommandChan     chan *logCommandContainer
+	returnsRequestTimeoutChan chan *requestTimeoutContainer
 	//
-	// Who does the local node think is the current leader.
-	currentLeader int32
+	// Channel to handle log commands coming from app. These will be gRPCed to the leader which may be ourselves
+	// or another node in the cluster.
+	localLogCommandChan chan *logCommandContainer
+	//
+	// Who does the local node think is the current leader. This is set in the context of the raftEngine go routine
+	// but can be accessed from an application accessor.
+	currentLeader *atomic.Int32
 	// publisher handles publishing of log commands which have been committed to the local application managing
 	// its distributed state machine using the log commands.
 	publisher *raftLogPublisher
@@ -131,12 +139,12 @@ const indexNotSet = -1
 func (re *raftEngine) logKV() []interface{} {
 	return []interface{}{
 		"localNodeIndex", re.node.index,
-		"CurrentTerm", re.CurrentTerm,
+		"currentTerm", re.CurrentTerm,
 		"commitIndex", re.commitIndex.Load(),
 		"appliedIndex", re.lastApplied.Load(),
 		"state", re.state,
 		"VotedFor", re.VotedFor,
-		"currentLeader", re.currentLeader}
+		"currentLeader", re.currentLeader.Load()}
 }
 
 type requestVoteContainer struct {
@@ -160,6 +168,13 @@ type appendEntryContainer struct {
 	returnChan chan *appendEntryContainer
 }
 
+type logCommandContainer struct {
+	request    *raft_pb.LogCommandRequest
+	err        error
+	reply      *raft_pb.LogCommandReply
+	returnChan chan *logCommandContainer
+}
+
 func (msg *appendEntryContainer) getIndexRangeForRequest() (int64, int64) {
 	firstInRange := int64(indexNotSet)
 	lastInRange := int64(indexNotSet)
@@ -180,9 +195,19 @@ func (msg *appendEntryContainer) getIndexRangeForRequest() (int64, int64) {
 func initRaftEngine(ctx context.Context, n *Node) error {
 
 	re := &raftEngine{
-		node:        n,
-		commitIndex: atomic.NewInt64(0),
-		lastApplied: atomic.NewInt64(0),
+		node:                      n,
+		inboundAppendEntryChan:    make(chan *appendEntryContainer, n.config.channelDepth.serverEvents),
+		inboundRequestVoteChan:    make(chan *requestVoteContainer, n.config.channelDepth.serverEvents),
+		inboundLogCommandChan:     make(chan *logCommandContainer, n.config.channelDepth.serverEvents),
+		inboundRequestTimeoutChan: make(chan *requestTimeoutContainer, n.config.channelDepth.serverEvents),
+		returnsAppendEntryChan:    make(chan *appendEntryContainer, n.config.channelDepth.serverEvents),
+		returnsRequestVoteChan:    make(chan *requestVoteContainer, n.config.channelDepth.serverEvents),
+		returnsLogCommandChan:     make(chan *logCommandContainer, n.config.channelDepth.serverEvents),
+		returnsRequestTimeoutChan: make(chan *requestTimeoutContainer, n.config.channelDepth.serverEvents),
+		localLogCommandChan:       make(chan *logCommandContainer, 1),
+		commitIndex:               atomic.NewInt64(0),
+		lastApplied:               atomic.NewInt64(0),
+		currentLeader:             atomic.NewInt32(int32(noLeader)),
 	}
 
 	n.engine = re
@@ -248,7 +273,7 @@ func (re *raftEngine) replaceTermIfNewer(rxTerm int64) termComparisonResult {
 		// update currentTerm and votedFor - this will result in the persistent data being updated.
 		re.CurrentTerm = rxTerm
 		re.updateVotedFor(notVotedThisTerm)
-		re.currentLeader = noLeader
+		re.currentLeader.Store(int32(noLeader))
 		re.node.logger.Debugw("raftEngine declaring new CurrentTerm", re.logKV()...)
 
 		return newTerm
@@ -259,7 +284,8 @@ func (re *raftEngine) replaceTermIfNewer(rxTerm int64) termComparisonResult {
 	}
 }
 
-// candidateStateFn implements the behaviour of the node while in candidate state.
+// candidateStateFn implements the behaviour of the node while in candidate state. While in candidate state
+// we do not handle the localLogCommandChan - no leader to pass request too.
 func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 
 	defer func() {
@@ -342,7 +368,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 						append(re.logKV(), "remoteNodeIndex", msg.request.LeaderId)...)
 				default: // election completed... return to follower state.
 					ltTimerStop()
-					re.currentLeader = msg.request.LeaderId
+					re.currentLeader.Store(msg.request.LeaderId)
 					re.node.logger.Debugw(
 						"raftEngine candidate, AppendEntry request results in new leader for the term",
 						append(re.logKV(), "remoteNodeIndex", msg.request.LeaderId)...)
@@ -419,7 +445,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 
 	re.node.logger.Debugw("raftEngine entering state", "new", leader)
-	re.currentLeader = re.node.index
+	re.currentLeader.Store(re.node.index)
 	re.state = leader
 
 	defer func() {

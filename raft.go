@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"github.com/ccassar/raft/internal/raft_pb"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -46,6 +47,7 @@ type NodeConfig struct {
 	// Channel depths (optional). If not set, depths will default to sensible values.
 	channelDepth struct {
 		clientEvents int32
+		serverEvents int32
 	}
 	//
 	// Configurable raft timers.
@@ -109,6 +111,10 @@ func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 		cfg.channelDepth.clientEvents = 32
 	}
 
+	if cfg.channelDepth.serverEvents == 0 {
+		cfg.channelDepth.serverEvents = 32
+	}
+
 	if cfg.LogDB == "" {
 		return raftErrorf(
 			RaftErrorMissingNodeConfig,
@@ -121,8 +127,7 @@ func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 // Node tracks the state and configuration of this local node. Public access to services provided by node are concurrency
 // safe. Node structure carries the state of the local running raft instance.
 type Node struct {
-	// My index in the cluster. This attribute is set once we greedily find a node in NodeConfig.Nodes, for which we can
-	// acquire a local socket.
+	// My index in the cluster. This attribute is set once and is immutable (i.e. can be accessed from anywhwere).
 	index int32
 	// Readonly state provided when the Node is created.
 	config *NodeConfig
@@ -422,6 +427,47 @@ func MakeNode(
 	}()
 
 	return n, nil
+}
+
+// node.LogCommand is a blocking call which accepts a log command request from the application,
+// and returns an error if log command failed to commit. The implementation takes care of proxying the request
+// and finding and forwarding the request to the current leader.
+//
+// LogCommand can carry a batch of commands as data. These are treated atomically by raft. This is a slightly cheeky
+// way of improving throughput through the system.
+func (n *Node) LogCommand(ctx context.Context, data []byte) error {
+
+	// Prep return channel for result.
+	returnChan := make(chan *logCommandContainer, 1)
+
+	container := &logCommandContainer{
+		request:    &raft_pb.LogCommandRequest{},
+		returnChan: returnChan,
+	}
+
+	select {
+	case n.engine.localLogCommandChan <- container:
+	case <-ctx.Done():
+		return raftErrorf(ctx.Err(), "log command operation aborted")
+	}
+
+	select {
+	case result := <-returnChan:
+
+		if result.err != nil {
+			return raftErrorf(result.err, "log command operation failed")
+		}
+
+		if !result.reply.Ack {
+			return raftErrorf(RaftErrorLogCommandRejected, "log command operation rejected")
+		}
+
+		return nil
+
+	case <-ctx.Done():
+		return raftErrorf(ctx.Err(), "log command operation aborted")
+	}
+
 }
 
 // Trigger graceful shutdown, and wait until this is complete.
