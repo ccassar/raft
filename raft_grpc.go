@@ -143,8 +143,8 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	//
 	// Append configured options so they can overwrite the defaults too.
-	if n.config.ServerOptionsFn != nil {
-		options = append(options, n.config.ServerOptionsFn(s.localAddr)...)
+	if n.config.serverOptionsFn != nil {
+		options = append(options, n.config.serverOptionsFn(s.localAddr)...)
 	}
 
 	s.grpcServer = grpc.NewServer(options...)
@@ -297,8 +297,8 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(unaryInterceptorChain...))}
 
 	// Append client provided dial options specifically for this client to server connection.
-	if n.config.ClientDialOptionsFn != nil {
-		options = append(options, n.config.ClientDialOptionsFn(n.messaging.server.localAddr, c.remoteAddress)...)
+	if n.config.clientDialOptionsFn != nil {
+		options = append(options, n.config.clientDialOptionsFn(n.messaging.server.localAddr, c.remoteAddress)...)
 	}
 
 	conn, err := grpc.DialContext(ctx, c.remoteAddress, options...)
@@ -389,7 +389,7 @@ func initClients(ctx context.Context, n *Node) error {
 				remoteAddress: remoteNodeAddress,
 				// Event channel is how the core of the raft communicates with a gRPC client to the remote node
 				// associated with this client.
-				eventChannel: make(chan event, n.config.ChannelDepth.ClientEvents),
+				eventChannel: make(chan event, n.config.channelDepth.clientEvents),
 				flush:        atomic.NewInt32(0),
 			}
 			clients[int32(i)] = client

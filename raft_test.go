@@ -32,22 +32,13 @@ func TestMakeNode(t *testing.T) {
 	nodeCfgs := []NodeConfig{{
 		Nodes:   []string{":8088", ":8089", ":8090"},
 		LogDB:   "test/boltdb.8088",
-		LogCmds: make(chan []byte),
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}}, {
+		LogCmds: make(chan []byte)}, {
 		Nodes:   []string{":8088", ":8089", ":8090"},
 		LogDB:   "test/boltdb.8089",
-		LogCmds: make(chan []byte),
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}}, {
+		LogCmds: make(chan []byte)}, {
 		Nodes:   []string{":8088", ":8089", ":8090"},
 		LogDB:   "test/boltdb.8090",
-		LogCmds: make(chan []byte),
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}},
+		LogCmds: make(chan []byte)},
 	}
 
 	// Setup prometheus endpoint on default registry.
@@ -66,20 +57,25 @@ func TestMakeNode(t *testing.T) {
 			"NEGATIVE Cluster of two",
 			[]NodeConfig{{
 				Nodes:   []string{":8088", ":8089"},
-				LogCmds: make(chan []byte),
-				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-					return []grpc.DialOption{grpc.WithInsecure()}
-				}}},
+				LogCmds: make(chan []byte)}},
 			[]NodeOption{},
 			false,
 			func(ctx context.Context, nodes []*Node) error { return nil },
 		},
 		{
-			"NEGATIVE Node Config Missing Explicit Security Option",
+			"NEGATIVE Node Config Missing LogDB",
 			[]NodeConfig{{
-				Nodes:               []string{":8088", ":8089", ":8090"},
-				LogCmds:             make(chan []byte),
-				ClientDialOptionsFn: nil}},
+				Nodes:   []string{":8088", ":8089", ":8090"},
+				LogCmds: make(chan []byte)}},
+			[]NodeOption{},
+			false,
+			func(ctx context.Context, nodes []*Node) error { return nil },
+		},
+		{
+			"NEGATIVE Node Config Missing LogCmds channel",
+			[]NodeConfig{{
+				Nodes: []string{":8088", ":8089", ":8090"},
+				LogDB: "mydb"}},
 			[]NodeOption{},
 			false,
 			func(ctx context.Context, nodes []*Node) error { return nil },
@@ -190,7 +186,8 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 	nc := NewNodeConfig()
 	nc.Nodes = []string{":8080", ":8081", ":8082"}
 	nc.LogCmds = make(chan []byte)
-	nc.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+
+	clientDialOptionsFn := func(local, remote string) []grpc.DialOption {
 		tlsCfg := &tls.Config{
 			ServerName:   serverToName[remote],                   // server name,
 			Certificates: []tls.Certificate{serverToCert[local]}, // client cert
@@ -198,7 +195,7 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		}
 		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
 	}
-	nc.ServerOptionsFn = func(local string) []grpc.ServerOption {
+	serverOptionsFn := func(local string) []grpc.ServerOption {
 		tlsCfg := &tls.Config{
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			Certificates: []tls.Certificate{serverToCert[local]},
@@ -222,6 +219,8 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		nc.LogDB = fmt.Sprintf("test/boltdb.%d", i)
 		wg.Add(1)
 		n, err := MakeNode(ctx, &wg, nc, int32(i),
+			WithClientDialOptionsFn(clientDialOptionsFn),
+			WithServerOptionsFn(serverOptionsFn),
 			WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false),
 			WithMetrics(metricsReg[i], true))
 
@@ -341,22 +340,23 @@ func TestElectionFollowerCandidate(t *testing.T) {
 
 	nc := NodeConfig{
 		Nodes:   []string{":8088", ":8089", ":8090"},
-		LogCmds: make(chan []byte),
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}}
+		LogDB:   "test/boltdb.0",
+		LogCmds: make(chan []byte)}
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	wg.Add(1)
-	_, err := MakeNode(ctx, &wg, nc, 0, WithLogger(l, false))
+	_, err := MakeNode(ctx, &wg, nc, 0,
+		WithLogger(l, false),
+		WithLeaderTimeout(time.Second),
+		WithChannelDepthToClientOffload(64))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	//TODO Continue test
+	//TODO Extensive Election Testing
 	time.Sleep(time.Second * 5)
 	cancel()
 	wg.Wait()
@@ -372,21 +372,10 @@ func ExampleMakeNode() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	//
-	// At a minimum, we need config to describe
-	//  1. cluster nodes
-	//  2. specify TLS or absence of it. We adopt the same stance as the grpc library;
-	//     no TLS has to be explicitly requested and we do not default to it.
-	//
-	// Note how in this example we rely on the default zap logger set up by raft. This logging can
-	// be disabled using  WithLogger(nil), or customised by specifying a logger instead of nil.
 	cfg := NewNodeConfig()
 	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
 	cfg.LogCmds = make(chan []byte, 32)
 	cfg.LogDB = "mydb.bbolt"
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
-	}
 
 	wg.Add(1)
 	localIndex := int32(2) // say, if we are node3.example.com
@@ -443,9 +432,6 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
 	cfg.LogCmds = make(chan []byte, 32)
 	cfg.LogDB = "mydb.bbolt"
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
-	}
 
 	loggerCfg := DefaultZapLoggerConfig()
 	logger, err := loggerCfg.Build( /* custom options can be provided here */ )
@@ -454,7 +440,9 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 	}
 
 	wg.Add(1)
-	n, err := MakeNode(ctx, &wg, cfg, 2, WithLogger(logger, false))
+	n, err := MakeNode(ctx, &wg, cfg, 2,
+		WithLogger(logger, false),
+		WithLeaderTimeout(time.Second))
 	if err != nil {
 		/// handle error
 	}
@@ -501,7 +489,8 @@ func ExampleMakeNode_withTLSConfiguration() {
 	nc.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
 	nc.LogCmds = make(chan []byte, 32)
 	nc.LogDB = "mydb.bbolt"
-	nc.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+
+	clientDialOptionsFn := func(local, remote string) []grpc.DialOption {
 		tlsCfg := &tls.Config{
 			ServerName:   serverToName[remote],
 			Certificates: []tls.Certificate{localCert},
@@ -511,7 +500,8 @@ func ExampleMakeNode_withTLSConfiguration() {
 		}
 		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
 	}
-	nc.ServerOptionsFn = func(local string) []grpc.ServerOption {
+
+	serverOptionsFn := func(local string) []grpc.ServerOption {
 		tlsCfg := &tls.Config{
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			Certificates: []tls.Certificate{localCert},
@@ -533,7 +523,10 @@ func ExampleMakeNode_withTLSConfiguration() {
 
 	wg.Add(1)
 	// if we are starting up node1.example.com, index would be 0
-	n, err := MakeNode(ctx, &wg, nc, 0, WithLogger(l, true))
+	n, err := MakeNode(ctx, &wg, nc, 0,
+		WithClientDialOptionsFn(clientDialOptionsFn),
+		WithServerOptionsFn(serverOptionsFn),
+		WithLogger(l, true))
 	if err != nil {
 		// handle err
 	}
@@ -559,9 +552,6 @@ func ExampleMakeNode_withDefaultMetricsRegistry() {
 	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
 	cfg.LogCmds = make(chan []byte, 32)
 	cfg.LogDB = "mydb.bbolt"
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
-	}
 
 	_, err = MakeNode(ctx, &wg, cfg, 1, // say if we are node2.example.com
 		WithMetrics(nil, true),
@@ -591,9 +581,6 @@ func ExampleMakeNode_withDedicatedMetricsRegistry() {
 	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
 	cfg.LogCmds = make(chan []byte, 32)
 	cfg.LogDB = "mydb.bbolt"
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
-	}
 
 	myregistry := prometheus.NewRegistry()
 	// Do remember to serve metrics by setting up the server which serves the prometheus handler

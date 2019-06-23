@@ -68,10 +68,10 @@ whether we track the latency distribution of RPC calls.
 
 #### TLS: Protecting Intracluster Messaging
 
-The Raft package supports protecting intra-cluster traffic with mutually authenticated TLS. Client dial
-options can be provided by the application as part of `MakeNode()` initialisation. These `grpc.DialOptions` are
-used by the local node when dialing into remote nodes. Godoc provides [an example](https://godoc.org/github.com/ccassar/raft#example-MakeNode--WithTLSConfiguration)
-of how to run with TLS enabled and with mutual authentication between server and client.
+The Raft package supports protecting intra-cluster traffic with mutually authenticated TLS. Client dial (`grpc.DialOptions`)
+and server (`grpc.ServerOptions`) options can be provided by the application as part of `MakeNode()` initialisation.
+Godoc provides [an example](https://godoc.org/github.com/ccassar/raft#example-MakeNode--WithTLSConfiguration) of how to
+run with TLS enabled and with mutual authentication between server and client.
 
 ### Metrics
 
@@ -137,9 +137,10 @@ Done so far:
 
 In progress;
 
-- election state machine.
+- election state machine; UT
+- log replication
 
-Target is to cover all of Raft including cluster membership extensions, log compaction, exactly-once 
+Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
 guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
 
 
@@ -157,7 +158,8 @@ referring to the gRPC client functionality which a Node uses to interact with ot
 servers in the cluster. The term 'application' is used to refer to the entity reading and consuming
 log updates. In the raft specifications, 'application' is called client.
  
-From raftEngine to gRPC client goroutines, we never block with out timeout. This constraint should always be satisfied
+From raftEngine to gRPC client goroutines, we never block - if channel if full raftEngine side proceeds.
+Client side recovers by pulling when channel starts to drain. This constraint should always be satisfied
 because this is what ensures that we never livelock with client goroutine pushing to raftEngine, and raftEngine
 trying to push to raftEngine. 
 

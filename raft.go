@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -11,8 +12,9 @@ import (
 	"time"
 )
 
-// NodeConfig is, well,  configuration for the local node. Package expects configuration to be passed in when starting
-// up the node using MakeNode.
+// NodeConfig is the mandatory configuration for the local node. Every field in NodeConfig must be provided by
+// application using the raft package. NodeConfig is passed in when starting up the node using MakeNode.
+// (Optional configuration can be passed in using WithX NodeOption options).
 type NodeConfig struct {
 	// Raft cluster node addresses. Nodes should include all the node addresses including the local one, in the
 	// form address:port. This makes configuration easy in that all nodes can share the same configuration.
@@ -29,30 +31,32 @@ type NodeConfig struct {
 	// LogDB points at file location which is the home of the persisted logDB.
 	LogDB string
 	//
+	// Private fields below are set throught he WithX options passed in to make node.
+	//
 	// Pass in method which provides dial options to use when connecting as gRPC client with other nodes as servers.
 	// Exposing this configuration allows application to determine whether, for example, to use TLS in raft exchanges.
 	// The callback passes in the local node and remote node (as in Nodes above) for which we are setting up client
 	// connection.
-	ClientDialOptionsFn func(local, remote string) []grpc.DialOption
+	clientDialOptionsFn func(local, remote string) []grpc.DialOption
+	//
 	// Pass in method which provides server side grpc options. These will be merged in with default options, with
 	// default options overridden if provided in configuration. The callback passes in the local node.
-	ServerOptionsFn func(local string) []grpc.ServerOption
+	serverOptionsFn func(local string) []grpc.ServerOption
 	//
 	// Channel depths (optional). If not set, depths will default to sensible values.
-	ChannelDepth struct {
-		ServerEvents int32
-		ClientEvents int32
+	channelDepth struct {
+		clientEvents int32
 	}
 	//
 	// Configurable raft timers.
-	Timers struct {
-		// LeaderTimeout is used to determine the maximum period which will elapse without getting AppendEntry
-		// messages from the leader. On the follower side, a random value between LeaderTimeout and 2*LeaderTimeout is
+	timers struct {
+		// leaderTimeout is used to determine the maximum period which will elapse without getting AppendEntry
+		// messages from the leader. On the follower side, a random value between leaderTimeout and 2*leaderTimeout is
 		// used by the raft package to determine when to force an election. On the leader side, leader will attempt
-		// to send at least one AppendEntry (possible empty if necessary) within ever LeaderTimeout period. Randomized
+		// to send at least one AppendEntry (possible empty if necessary) within ever leaderTimeout period. Randomized
 		// election timeouts minimise the probability of split votes and resolves them quickly when they happen as
-		// described in Section 3.4 of CBTP. LeaderTimeout defaults to 2s if not set.
-		LeaderTimeout time.Duration
+		// described in Section 3.4 of CBTP. leaderTimeout defaults to 2s if not set.
+		leaderTimeout time.Duration
 	}
 }
 
@@ -92,28 +96,23 @@ func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 			localNodeIndex, len(cfg.Nodes))
 	}
 
-	if cfg.ClientDialOptionsFn == nil {
-		return raftErrorf(
-			RaftErrorMissingNodeConfig,
-			"no dial options method is provided in ClientDialOptionsFn, either TLS or grpc.WithInsecure() "+
-				"option must be provided. Raft does NOT default to insecure unless explicitly requested by application",
-			minNodesInCluster)
+	// Default to insecure dial options (i.e. no underlying TLS)
+	cfg.clientDialOptionsFn = func(l, r string) []grpc.DialOption {
+		return []grpc.DialOption{grpc.WithInsecure()}
 	}
 
-	if cfg.Timers.LeaderTimeout == 0 {
-		cfg.Timers.LeaderTimeout = time.Duration(2 * time.Second)
+	if cfg.timers.leaderTimeout == 0 {
+		cfg.timers.leaderTimeout = time.Duration(2 * time.Second)
 	}
 
-	if cfg.ChannelDepth.ClientEvents == 0 {
-		cfg.ChannelDepth.ClientEvents = 32
-	}
-
-	if cfg.ChannelDepth.ServerEvents == 0 {
-		cfg.ChannelDepth.ServerEvents = 32
+	if cfg.channelDepth.clientEvents == 0 {
+		cfg.channelDepth.clientEvents = 32
 	}
 
 	if cfg.LogDB == "" {
-		cfg.LogDB = "boltdb.defaultDB"
+		return raftErrorf(
+			RaftErrorMissingNodeConfig,
+			"missing LogDB, a file name where local node persists both metadata and log entries")
 	}
 
 	return nil
@@ -227,8 +226,53 @@ func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
 	}
 }
 
+// WithLeaderTimeout used with MakeNode to specify leader timeout: leader timeout is used to determine the maximum period
+// which can elapse without getting AppendEntry messages from the leader without forcing a new election. On the follower
+// side, a random value between leaderTimeout and 2*leaderTimeout is used by the raft package to determine when to force
+// an election. On the leader side, leader will attempt to send at least one AppendEntry (possible empty if necessary)
+// within ever leaderTimeout period. Randomized election timeouts minimise the probability of split votes and resolves
+// them quickly when they happen as described in Section 3.4 of CBTP. LeaderTimeout defaults to 2s if not set.
 func WithLeaderTimeout(leaderTimeout time.Duration) NodeOption {
+	return func(n *Node) error {
+		n.config.timers.leaderTimeout = leaderTimeout
+		return nil
+	}
+}
 
+// WithChannelDepthToClientOffload allows the application to overload the channel depth between the raft core engine,
+// and the goroutine which handles messaging to the remote nodes. A sensible default value is used if this option is not
+// specified.
+func WithChannelDepthToClientOffload(depth int32) NodeOption {
+	return func(n *Node) error {
+		if depth <= 0 {
+			return errors.New("bad channel depth in WithChannelDepthToClientOffload, must be > 0")
+		}
+		n.config.channelDepth.clientEvents = depth
+		return nil
+	}
+}
+
+// WithServerOptionsFn sets up callback used to allow application to specify server side grpc options for local raft
+// node. These server options will be merged in with default options, with default options overwritten if provided
+// by callback. The callback passes in the local node as specified in the Nodes configuration. Server side options
+// could be used, for example, to set up mutually authenticated TLS protection of exchanges with other nodes.
+func WithServerOptionsFn(fn func(local string) []grpc.ServerOption) NodeOption {
+	return func(n *Node) error {
+		n.config.serverOptionsFn = fn
+		return nil
+	}
+}
+
+// WithClientDialOptionsFn sets up callback used to allow application to specify client side grpc options for local
+// raft node. These client options will be merged in with default options, with default options overwritten if provided
+// by callback. The callback passes in the local/remote node pair in the form specified in the Nodes configuration.
+// Client side options could be used, for example, to set up mutually authenticated TLS protection of exchanges
+// with other nodes.
+func WithClientDialOptionsFn(fn func(local, remote string) []grpc.DialOption) NodeOption {
+	return func(n *Node) error {
+		n.config.clientDialOptionsFn = fn
+		return nil
+	}
 }
 
 // MakeNode starts the raft node according to configuration provided.
@@ -255,7 +299,8 @@ func WithLeaderTimeout(leaderTimeout time.Duration) NodeOption {
 // for wait group before exiting. FatalErrorChannel method on the returned Node returns the error channel the
 // application should consume.
 //
-// MakeNode also accepts logging and metrics options (see WithMetrics and WithLogger).
+// MakeNode also accepts various options including, gRPC server and dial options, logging and metrics (see functions
+// returning NodeOption like WithMetrics, WithLogging etc).
 //
 // For logging, we would like to support structured logging. This makes specifying a useful
 // logger interface a little messier. Instead we depend on Uber zap and its interface, but allow user to
@@ -285,6 +330,7 @@ func MakeNode(
 
 	n := &Node{
 		index:     localNodeIndex,
+		config:    &cfg,
 		messaging: &raftMessaging{},
 		// A single fatal error is sufficient to do the job. Create buffered channel of 1. This matters,
 		// because when we signal, where we to block, we would skip enqueuing signal on the basis we know at
@@ -311,8 +357,6 @@ func MakeNode(
 	}
 
 	n.logger.Info("raft package, starting up (logging can be customised or disabled using WithLogger option)")
-
-	n.config = &cfg
 
 	err = initMessaging(ctx, n)
 	if err != nil {
@@ -388,7 +432,7 @@ func (n *Node) blockOnGracefulShutdown() {
 }
 
 func (n *Node) keepalivePeriod() time.Duration {
-	return n.config.Timers.LeaderTimeout / 3
+	return n.config.timers.leaderTimeout / 3
 }
 
 //

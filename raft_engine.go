@@ -302,7 +302,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 			})
 		}
 
-		leaderTimeout := randomiseDuration(re.node.config.Timers.LeaderTimeout)
+		leaderTimeout := randomiseDuration(re.node.config.timers.leaderTimeout)
 		re.node.logger.Debugw("raftEngine candidate, extending leader timeout",
 			append(re.logKV(), "period", leaderTimeout.String())...)
 
@@ -607,7 +607,7 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 
 	for {
 
-		leaderTimeout := randomiseDuration(re.node.config.Timers.LeaderTimeout)
+		leaderTimeout := randomiseDuration(re.node.config.timers.leaderTimeout)
 		re.node.logger.Debugw("raftEngine follower, extending leader timeout",
 			append(re.logKV(), "period", leaderTimeout.String())...)
 
