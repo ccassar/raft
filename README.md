@@ -8,9 +8,11 @@
 Yet another implementation of raft, in go.
 
 This package is intended to be embeddable in any application run as a cluster of coordinating instances and 
-wishing to benefit from a distributed replicated log.
+wishing to benefit from a distributed replicated log of events.
 
-The focus of this implementation is an all-batteries-included, production quality, complete implementation.
+The focus of this implementation is an all-batteries-included, production quality, extensively tested, complete
+implementation.
+
 Intra-cluster connectivity is implemented over gRPC with support for TLS protection with mutual authentication.
 
 Observability is central to a production-quality implementation; structured logging (using Uber zap library)
@@ -138,7 +140,8 @@ Done so far:
 In progress;
 
 - election state machine; UT
-- log replication
+- move client to notify and pull for AppendEntry
+- pick up localLogCommandChan in all states with push back if channel to client is full.
 
 Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
 guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
@@ -152,6 +155,10 @@ generated source.
 
 
 ### Raw Design Notes
+
+The figure below represents the main components in the raft package and the interactions with the application.
+
+![Raft Package Overview](resources/raftOverview.png)
 
 ASIDE; the choice of term 'client' can lead to confusion - almost invariably client is
 referring to the gRPC client functionality which a Node uses to interact with other nodes'
@@ -170,10 +177,13 @@ The package uses multiple goroutines;
  of the other nodes in the cluster). A goroutine fed through a buffered channel receives messages which need to be
  communicated to the remote node. The goroutine handles the call and blocks waiting for response, and on receipt,
  delivers the response back to the raft engine thread.
+ - grpc servers handling RPCs initiated by remote nodes in the cluster
  - the central goroutine handles the raft state machine. Messages received from other goroutines and timer events are
  the main inputs to the state machine.
- - An application facing goroutine is responsible for feeding the channel of 'applied' log entries to the application.
+ - while in leader state, an independent go routine handles acknowledging log command requests from local or remote
+   applications when the log command is committed.
+ - an application facing goroutine is responsible for feeding the channel of 'applied' log entries to the application.
   
-Synchronisation is lock free and largely message passing based. Other synchronisation primitives used include atomic
-updates to track when channels between raft engine and gRPC client goroutines should be flushed. 
- 
+Synchronisation is mostly lock free and largely message passing based. Other synchronisation primitives used include atomic
+updates to track when channels between raft engine and gRPC client goroutines should be flushed. The acker shares the list
+of pending acknowledgement with the raftEngine. 

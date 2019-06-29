@@ -23,6 +23,14 @@ func (pub *raftLogPublisher) logKV() []interface{} {
 	}
 }
 
+// notify is called to wake up publisher to determine whether it needs to push newly committed updates to application.
+func (pub *raftLogPublisher) notify() {
+	select {
+	case pub.updatesAvailable <- struct{}{}:
+	default:
+	}
+}
+
 func (pub *raftLogPublisher) run(ctx context.Context, wg *sync.WaitGroup) {
 
 	defer wg.Done()

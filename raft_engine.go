@@ -129,6 +129,7 @@ func (l *raftEngineLeader) resetKeepalive(ctx context.Context, clientIndex int32
 type raftEngineLeader struct {
 	engine             *raftEngine
 	clients            map[int32]*clientStateAtLeader
+	acker              *raftLogAcknowledger
 	clientKeepaliveDue chan int32
 }
 
@@ -310,6 +311,11 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 			votesReceived: map[int32]bool{},
 		}
 
+		lastLogTerm, lastLogIndex, err := re.logEntryGetLastTermAndIndex()
+		if err != nil {
+			return nil // error logged and we will be shut down.
+		}
+
 		for _, client := range re.node.messaging.clients {
 			postMessageToClientWithFlush(ctx, client, &requestVoteEvent{
 				client: client,
@@ -317,8 +323,8 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 					request: &raft_pb.RequestVoteRequest{
 						Term:         re.CurrentTerm,
 						CandidateId:  re.node.index,
-						LastLogIndex: 0, // TODO
-						LastLogTerm:  0, // TODO
+						LastLogIndex: lastLogIndex,
+						LastLogTerm:  lastLogTerm,
 						To:           client.index,
 					},
 					reply:      nil,
@@ -448,16 +454,27 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 	re.currentLeader.Store(re.node.index)
 	re.state = leader
 
+	ackerContext, cancel := context.WithCancel(ctx)
+	var ackerWg sync.WaitGroup
+
 	defer func() {
 		// Purge leader state on the way out of this state.
+		cancel()
+		ackerWg.Wait()
 		re.leaderState = nil
+
 	}()
 
 	//
-	// First thing we do when we become leaders is set up fresh state.
+	// First thing we do when we become leaders is set up fresh state. This includes setting up the acker; independent
+	// goroutine which pushes acknowledgement to local or remote applications once their log command is committed.
+	// The lifetime of the acker is tied to this node being leader. When we stop being leader the defer function above
+	// stops the acker, and discards its state.
+	ackerWg.Add(1)
 	re.leaderState = &raftEngineLeader{
 		engine:  re,
 		clients: map[int32]*clientStateAtLeader{},
+		acker:   createLogAcknowledgerAndRun(ackerContext, &ackerWg, re.commitIndex, re.node.logger),
 	}
 
 	// Setup per-client keepalive timers.
@@ -818,10 +835,7 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 				// may get a notification and it is already up to date which is fine.
 				re.commitIndex.Store(newCommittedAndLearned)
 				re.node.logger.Debugw("AppendEntry handler updated commitIndex", re.logKV()...)
-				select {
-				case re.publisher.updatesAvailable <- struct{}{}:
-				default:
-				}
+				re.publisher.notify()
 			}
 		}
 

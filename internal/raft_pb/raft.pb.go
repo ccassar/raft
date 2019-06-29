@@ -690,7 +690,7 @@ func (c *raftServiceClient) RequestTimeout(ctx context.Context, in *RequestTimeo
 
 func (c *raftServiceClient) LogCommand(ctx context.Context, in *LogCommandRequest, opts ...grpc.CallOption) (*LogCommandReply, error) {
 	out := new(LogCommandReply)
-	err := c.cc.Invoke(ctx, "/raft_pb.RaftService/LogCommand", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/raft_pb.RaftService/LogProduce", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -729,7 +729,7 @@ func (*UnimplementedRaftServiceServer) RequestTimeout(ctx context.Context, req *
 	return nil, status.Errorf(codes.Unimplemented, "method RequestTimeout not implemented")
 }
 func (*UnimplementedRaftServiceServer) LogCommand(ctx context.Context, req *LogCommandRequest) (*LogCommandReply, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method LogCommand not implemented")
+	return nil, status.Errorf(codes.Unimplemented, "method LogProduce not implemented")
 }
 func (*UnimplementedRaftServiceServer) ApplicationLoopback(ctx context.Context, req *AppNonce) (*AppNonce, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ApplicationLoopback not implemented")
@@ -803,7 +803,7 @@ func _RaftService_LogCommand_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/raft_pb.RaftService/LogCommand",
+		FullMethod: "/raft_pb.RaftService/LogProduce",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RaftServiceServer).LogCommand(ctx, req.(*LogCommandRequest))
@@ -846,7 +846,7 @@ var _RaftService_serviceDesc = grpc.ServiceDesc{
 			Handler:    _RaftService_RequestTimeout_Handler,
 		},
 		{
-			MethodName: "LogCommand",
+			MethodName: "LogProduce",
 			Handler:    _RaftService_LogCommand_Handler,
 		},
 		{

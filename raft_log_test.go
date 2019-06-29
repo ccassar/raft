@@ -6,7 +6,9 @@ import (
 	"github.com/ccassar/raft/internal/raft_pb"
 	"go.etcd.io/bbolt"
 	"go.uber.org/atomic"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestLogDBBasicOperations(t *testing.T) {
@@ -112,4 +114,70 @@ func TestLogDBBasicOperations(t *testing.T) {
 	}
 
 	re.shutdownLogDB()
+}
+
+func TestAcknowledgements(t *testing.T) {
+	const BASE = 10
+	const ACKS = 100
+	target := atomic.NewInt64(0)
+	l := testLoggerGet()
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	wg.Add(1)
+
+	acker := createLogAcknowledgerAndRun(ctx, &wg, target, l.Sugar())
+
+	var cmds []*logCommandContainer
+	for i := 0; i < ACKS; i++ {
+		cmds = append(cmds, &logCommandContainer{returnChan: make(chan *logCommandContainer, 1)})
+	}
+
+	for i, cmd := range cmds {
+		acker.trackPendingAck(cmd, int64(i+BASE))
+	}
+
+	// Notify...
+	acker.notify()
+
+	// We wait enough to know that the notification itself was handled. We know the notification is being
+	// handled when we find the space to issue another notification (strictly not a guarantee that the
+	// next test is water tight but good enough).
+	acker.updatesAvailable <- struct{}{}
+
+	// At this point we should not get anything on the channels.
+	for i := 0; i < ACKS; i++ {
+		select {
+		case <-cmds[i].returnChan:
+			t.Fatal("not expecting to receive and acknowledgements while target is set to 0")
+		default:
+		}
+	}
+
+	// At this point we should only get update from the first...
+	target.Store(BASE)
+	acker.notify()
+	select {
+	case cmd := <-cmds[0].returnChan:
+		if !cmd.reply.Ack {
+			t.Fatal("expected to get ack set")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected to get ack within at least the timeout")
+	}
+
+	cancel()
+	wg.Wait()
+
+	// we should get error on all the rest (i.e. bar the first which would have been discarded by now.
+	for i := 1; i < ACKS; i++ {
+		select {
+		case <-cmds[i].returnChan:
+			if cmds[i].err == nil {
+				t.Fatal("not expecting to receive an acknowledgement but an error on cancellation")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("expected to get nack within at least the timeout")
+		}
+	}
+
 }

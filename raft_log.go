@@ -142,6 +142,22 @@ func (re *raftEngine) logEntryGetLast() (*raft_pb.LogEntry, error) {
 	return le, err
 }
 
+// logEntriesGet returns up to a maximum of maxEntries entries from the log.
+func (re *raftEngine) logEntryGetLastTermAndIndex() (term, index int64, err error) {
+	le, err := re.logEntryGetLast()
+	if err != nil {
+		re.node.signalFatalError(err)
+		return 0, 0, err
+	}
+	var lastLogIndex, lastLogTerm int64
+	if le != nil {
+		lastLogTerm = le.Term
+		lastLogIndex = le.Sequence
+	}
+
+	return lastLogTerm, lastLogIndex, nil
+}
+
 // logEntriesPurgeTail deletes all entries from the startIndex and above, startIndex included.
 func (re *raftEngine) logEntriesPurgeTail(startIndex int64) error {
 
