@@ -390,19 +390,28 @@ func testAddNodeWithDB(nodes []string, i int, db string) (*testNode, error) {
 }
 
 func TestDetectBlockedBoltDB(t *testing.T) {
+	var err error
+	n := make([]*testNode, 2)
 
 	nodes := []string{":8088", ":8089", ":8090"}
-	_, err := testAddNodeWithDB(nodes, 0, "test/boltdb.0")
+	n[0], err = testAddNodeWithDB(nodes, 0, "test/boltdb.0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = testAddNodeWithDB(nodes, 1, "test/boltdb.0")
+	n[1], err = testAddNodeWithDB(nodes, 1, "test/boltdb.0")
 	if err == nil {
 		t.Fatal("expected reused bbolt DB to force an error")
 	}
 
 	if errors.Cause(err) != RaftErrorLockedBoltDB {
 		t.Fatal("expected reused bbolt DB to force an error, but error returned is not expected one", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if n[i] != nil && n[i].cancel != nil {
+			n[i].cancel()
+			n[i].wg.Wait()
+		}
 	}
 
 }
