@@ -299,8 +299,9 @@ func TestInitMessaging(t *testing.T) {
 	}
 
 	n := &Node{
-		index:  1,
-		logger: l.Sugar(),
+		index:           1,
+		logger:          l.Sugar(),
+		fatalErrorCount: atomic.NewInt32(0),
 		config: &NodeConfig{Nodes: []string{
 			"1.2.3.4:12345",
 			":8989", // we expect this to be picked based on index.
