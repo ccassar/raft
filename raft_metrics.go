@@ -23,7 +23,10 @@ type metricsHolder struct {
 	detailed bool
 	//
 	// Metrics
+	// A slightly unorthodox use of metrics in some cases; we export state as metrics too (e.g. current role
+	// of node, which node the current node thinks is the leader etc).
 	stateGauge prometheus.Gauge
+	leader     prometheus.Gauge
 }
 
 // Set up a metricsHolder to collect metrics for a given node.
@@ -55,7 +58,17 @@ func initMetrics(registry *prometheus.Registry, namespace string, detailed bool,
 		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
 	})
 
-	registry.MustRegister(mh.stateGauge)
+	mh.leader = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   namespace,
+		Subsystem:   "raft",
+		Name:        "leader",
+		Help:        "current leader from the perspective of this node (-1 indicate no leader).",
+		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
+	})
+
+	registry.MustRegister(
+		mh.stateGauge,
+		mh.leader)
 
 	return mh
 }

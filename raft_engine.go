@@ -315,6 +315,27 @@ func (re *raftEngine) updateState(state nodeState) {
 		strings.ToUpper(state.String())), re.logKV()...)
 }
 
+func (re *raftEngine) updateCurrentLeader(l int32) {
+	oldLeader := re.currentLeader.Load()
+	re.currentLeader.Store(l)
+	if l == oldLeader {
+		return
+	} else if l != noLeader && oldLeader != noLeader {
+		// We never expect a leader transition with one being noLeader. (We always reset to noLeader on new term).
+		err := raftErrorf(RaftErrorLeaderTransitionInTerm, "leader update from %d to %d, unexpected",
+			oldLeader, l)
+		re.node.logger.Errorw("update current leader failure", append(re.logKV(), raftErrKeyword, err)...)
+		re.node.signalFatalError(err)
+		return
+	}
+
+	if re.node.metrics != nil {
+		re.node.metrics.leader.Set(float64(l))
+	}
+	re.node.logger.Infow(fmt.Sprintf("LEADER CHANGE: from %d to %d", oldLeader, l),
+		re.logKV()...)
+}
+
 // raftEngine.run runs the core of the raft algorithm. We have an event loop which handles the state of the raft node,
 // and which receives events; both timeouts and messages.
 func (re *raftEngine) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
@@ -370,7 +391,7 @@ func (re *raftEngine) replaceTermIfNewer(rxTerm int64) termComparisonResult {
 	case rxTerm > currentTerm:
 		// update currentTerm and votedFor - this will result in the persistent data being updated.
 		re.updateVotedFor(notVotedThisTerm)
-		re.currentLeader.Store(int32(noLeader))
+		re.updateCurrentLeader(int32(noLeader))
 		re.currentTerm.Store(rxTerm)
 		re.node.logger.Debugw("raftEngine declaring new CurrentTerm", re.logKV()...)
 
@@ -469,7 +490,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 						append(re.logKV(), "remoteNodeIndex", msg.request.LeaderId)...)
 				default: // election completed... return to follower state.
 					ltTimerStop()
-					re.currentLeader.Store(msg.request.LeaderId)
+					re.updateCurrentLeader(msg.request.LeaderId)
 					re.node.logger.Debugw(
 						"raftEngine candidate, AppendEntry request results in new leader for the term",
 						append(re.logKV(), "remoteNodeIndex", msg.request.LeaderId)...)
@@ -545,7 +566,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 
 func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 
-	re.currentLeader.Store(re.node.index)
+	re.updateCurrentLeader(re.node.index)
 	re.updateState(leader)
 
 	leaderCtx, cancel := context.WithCancel(ctx)
@@ -611,7 +632,7 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 					append(re.logKV(), "remoteNodeIndex", msg.request.LeaderId)...)
 			default: // new term, fall in.
 				re.node.logger.Debugw(
-					"raftEngine leader, AppendEntry request results in new term",
+					"raftEngine leader, AppendEntry request results in new term, new leader",
 					append(re.logKV(), "remoteNodeIndex", msg.request.LeaderId)...)
 				return re.followerStateFn
 			}
@@ -1003,6 +1024,8 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 				}
 			}
 
+			// We may have discovered a new leader
+			re.updateCurrentLeader(msg.request.LeaderId)
 		}
 
 		if err == nil && ack == true {

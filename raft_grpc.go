@@ -195,7 +195,18 @@ func initServer(ctx context.Context, n *Node) error {
 	if n.index < int32(len(n.config.Nodes)) {
 
 		le := n.config.Nodes[n.index]
-		listener, err := net.Listen("tcp", le)
+		var listener net.Listener
+
+		err := backoff.Retry(
+			func() error {
+				var err error
+				listener, err = net.Listen("tcp", le)
+				return err
+			},
+			backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 3),
+		)
+
+		// listener, err := net.Listen("tcp", le)
 		if err != nil {
 			err = raftErrorf(err, "failed to acquire local TCP socket for gRPC")
 			n.logger.Errorw("initServer failed (some other application or previous instance still using socket?)",

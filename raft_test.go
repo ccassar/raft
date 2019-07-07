@@ -101,6 +101,12 @@ func TestMakeNode(t *testing.T) {
 			func(ctx context.Context, nodes []*Node) error {
 				// Make sure we do not block event if channel is not drained.
 				for i := 0; i < 3; i++ {
+
+					// force signal failure with bad updates to current leader
+					nodes[0].engine.updateCurrentLeader(-1)
+					nodes[0].engine.updateCurrentLeader(2)
+					nodes[0].engine.updateCurrentLeader(1)
+					// Exercise the dampening showing we have taken fatal error already
 					nodes[0].signalFatalError(fmt.Errorf("testing signal fatal error %d", i))
 				}
 				errChan := nodes[0].FatalErrorChannel()
@@ -393,7 +399,7 @@ func TestDetectBlockedBoltDB(t *testing.T) {
 	var err error
 	n := make([]*testNode, 2)
 
-	nodes := []string{":8088", ":8089", ":8090"}
+	nodes := []string{":8188", ":8189", ":8190"}
 	n[0], err = testAddNodeWithDB(nodes, 0, "test/boltdb.0")
 	if err != nil {
 		t.Fatal(err)
@@ -413,7 +419,6 @@ func TestDetectBlockedBoltDB(t *testing.T) {
 			n[i].wg.Wait()
 		}
 	}
-
 }
 
 func TestElection(t *testing.T) {

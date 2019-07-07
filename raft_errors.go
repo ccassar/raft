@@ -72,6 +72,11 @@ const RaftErrorMissingLogger = Error(raftSentinel + "no logger setup")
 // and test against sentinel.
 const RaftErrorMissingNodeConfig = Error(raftSentinel + "node config insufficient")
 
+// RaftErrorLeaderTransitionInTerm is returned (extracted using errors.Cause(err)) if a transition in leader
+// happens without a change in term. This is a catastrophic unexpected error and would cause a shutdown
+// of raft package if it occurred.
+const RaftErrorLeaderTransitionInTerm = Error(raftSentinel + "mid term leader transition")
+
 // RaftErrorOutOfBoundsClient is returned (extracted using errors.Cause(err)) if logic produces a client
 // index for a client which does not exists. See ExampleMakeNode for an example of how to extract
 // and test against sentinel.
