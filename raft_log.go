@@ -9,6 +9,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
+	"time"
 )
 
 // logEntryGetSerialisedKey returns the []byte for key of log entry. We want this byte slice to provide ordering
@@ -40,10 +41,21 @@ func logEntryFromSerialised(b []byte) (*raft_pb.LogEntry, error) {
 	return &l, err
 }
 
-func (re *raftEngine) logEntryAdd(le *raft_pb.LogEntry) error {
+func (re *raftEngine) logAddEntry(le *raft_pb.LogEntry) error {
 
+	var err error
+	defer func() {
+		if err != nil {
+			err = raftErrorf(err, "adding an entry to the log failed, catastrophic failure")
+			re.node.logger.Errorw("persist entry to raft log",
+				append(re.logKV(), raftErrKeyword, err)...)
+			re.node.signalFatalError(err)
+		}
+	}()
+
+	var val []byte
 	key := logEntryGetSerialisedKey(le)
-	val, err := logEntryGetSerialised(le)
+	val, err = logEntryGetSerialised(le)
 	if err != nil {
 		return err
 	}
@@ -56,13 +68,23 @@ func (re *raftEngine) logEntryAdd(le *raft_pb.LogEntry) error {
 	return err
 }
 
-// logEntriesGet returns up to a maximum of maxEntries entries from the log.
-func (re *raftEngine) logEntriesGet(startIndex int64, maxEntries int) ([]*raft_pb.LogEntry, error) {
+// logGetEntries returns up to a maximum of maxEntries entries from the log.
+func (re *raftEngine) logGetEntries(startIndex int64, maxEntries int32) ([]*raft_pb.LogEntry, error) {
+
+	var err error
+	defer func() {
+		if err != nil {
+			err = raftErrorf(err, "fetch entries from log failed, catastrophic failure")
+			re.node.logger.Errorw("fetch entries from raft log",
+				append(re.logKV(), raftErrKeyword, err)...)
+			re.node.signalFatalError(err)
+		}
+	}()
 
 	results := make([]*raft_pb.LogEntry, 0, maxEntries)
 	key := logEntryGetSerialisedKey(&raft_pb.LogEntry{Sequence: startIndex})
 
-	err := re.logDB.View(func(tx *bolt.Tx) error {
+	err = re.logDB.View(func(tx *bolt.Tx) error {
 
 		var err error
 
@@ -75,7 +97,7 @@ func (re *raftEngine) logEntriesGet(startIndex int64, maxEntries int) ([]*raft_p
 				break
 			}
 			results = append(results, le)
-			if len(results) == maxEntries {
+			if int32(len(results)) == maxEntries {
 				break
 			}
 		}
@@ -83,16 +105,10 @@ func (re *raftEngine) logEntriesGet(startIndex int64, maxEntries int) ([]*raft_p
 		return err
 	})
 
-	if err != nil {
-		err = raftErrorf(err, "fetch entries from log failed")
-		re.node.logger.Errorw("fetch entries from raft log",
-			append(re.logKV(), raftErrKeyword, err)...)
-	}
-
 	return results, err
 }
 
-func (re *raftEngine) logEntryGet(index int64) (*raft_pb.LogEntry, error) {
+func (re *raftEngine) logGetEntry(index int64) (*raft_pb.LogEntry, error) {
 
 	key := logEntryGetSerialisedKey(&raft_pb.LogEntry{Sequence: index})
 
@@ -111,13 +127,15 @@ func (re *raftEngine) logEntryGet(index int64) (*raft_pb.LogEntry, error) {
 		err = raftErrorf(err, "single entry from log failed to deserialise, corrupted data in bbolt db?")
 		re.node.logger.Errorw("fetch single entry from raft log",
 			append(re.logKV(), raftErrKeyword, err)...)
+		re.node.signalFatalError(err)
 	}
 
 	return le, err
 }
 
-// logEntriesGet returns up to a maximum of maxEntries entries from the log.
-func (re *raftEngine) logEntryGetLast() (*raft_pb.LogEntry, error) {
+// logGetLastEntry returns last entry in the log if it exists, nil otherwise. Signal catastrophic failure if we
+// fail to access persistence layer.
+func (re *raftEngine) logGetLastEntry() (*raft_pb.LogEntry, error) {
 
 	var le *raft_pb.LogEntry
 
@@ -137,19 +155,24 @@ func (re *raftEngine) logEntryGetLast() (*raft_pb.LogEntry, error) {
 		err = raftErrorf(err, "fetch last entry from log failed")
 		re.node.logger.Errorw("fetch last entry from raft log",
 			append(re.logKV(), raftErrKeyword, err)...)
+		re.node.signalFatalError(err)
 	}
 
 	return le, err
 }
 
-// logEntriesGet returns up to a maximum of maxEntries entries from the log.
-func (re *raftEngine) logEntryGetLastTermAndIndex() (term, index int64, err error) {
-	le, err := re.logEntryGetLast()
+// logGetLastTermAndIndex last term and index in log. On error, we signal failure back,
+// and signal catastrophic failure.
+func (re *raftEngine) logGetLastTermAndIndex() (term, index int64, err error) {
+
+	lastLogIndex := indexNotSet
+	lastLogTerm := termNotSet
+
+	le, err := re.logGetLastEntry()
 	if err != nil {
-		re.node.signalFatalError(err)
-		return 0, 0, err
+		return termNotSet, indexNotSet, err
 	}
-	var lastLogIndex, lastLogTerm int64
+
 	if le != nil {
 		lastLogTerm = le.Term
 		lastLogIndex = le.Sequence
@@ -158,8 +181,8 @@ func (re *raftEngine) logEntryGetLastTermAndIndex() (term, index int64, err erro
 	return lastLogTerm, lastLogIndex, nil
 }
 
-// logEntriesPurgeTail deletes all entries from the startIndex and above, startIndex included.
-func (re *raftEngine) logEntriesPurgeTail(startIndex int64) error {
+// logPurgeTailEntries deletes all entries from the startIndex and above, startIndex included.
+func (re *raftEngine) logPurgeTailEntries(startIndex int64) error {
 
 	key := logEntryGetSerialisedKey(&raft_pb.LogEntry{Sequence: startIndex})
 
@@ -183,6 +206,7 @@ func (re *raftEngine) logEntriesPurgeTail(startIndex int64) error {
 		err = raftErrorf(err, "purge tail entries in log failed")
 		re.node.logger.Errorw("purge tail entries from raft log",
 			append(re.logKV(), raftErrKeyword, err)...)
+		re.node.signalFatalError(err)
 	}
 
 	return err
@@ -195,7 +219,7 @@ const (
 )
 
 func (re *raftEngine) nodePersistedDataGetSerialisedKey() []byte {
-	return []byte(fmt.Sprintf("NodePersistedDate[%d]", re.node.index))
+	return []byte(fmt.Sprintf("NodePersistedData[%d]", re.node.index))
 }
 
 // saveNodePersistedData saves node data which needs to be persisted into appropriate bucket in bbolt. This happens
@@ -203,7 +227,12 @@ func (re *raftEngine) nodePersistedDataGetSerialisedKey() []byte {
 func (re *raftEngine) saveNodePersistedData() error {
 
 	key := re.nodePersistedDataGetSerialisedKey()
-	data, err := proto.Marshal(&re.PersistedState)
+
+	ps := raft_pb.PersistedState{
+		VotedFor:    re.votedFor.Load(),
+		CurrentTerm: re.currentTerm.Load()}
+
+	data, err := proto.Marshal(&ps)
 	if err != nil {
 		goto failed
 	}
@@ -222,28 +251,39 @@ failed:
 	err = raftErrorf(err, "failed to save node persisted data")
 	re.node.logger.Errorw("saving node persisted data",
 		append(re.logKV(), raftErrKeyword, err)...)
+	re.node.signalFatalError(err)
 
 	return err
 }
 
-// loadNodePersistedData loads persisted data from BoltDB into the raftEngine structure. This happens at initialisation.
+// loadNodePersistedData loads persisted data from BoltDB into the raftEngine structure.
+// This happens at initialisation.
 func (re *raftEngine) loadNodePersistedData() error {
 
 	err := re.logDB.View(func(tx *bolt.Tx) error {
+
 		bucket := tx.Bucket([]byte(dbBucketNodePersistedData))
 		stream := bucket.Get(re.nodePersistedDataGetSerialisedKey())
+
 		if stream == nil {
 			return raftErrorf(RaftErrorNodePersistentData, "node persistent data missing for node %d",
 				re.node.index)
 		}
 
-		return proto.Unmarshal(stream, &re.PersistedState)
+		ps := raft_pb.PersistedState{}
+		err := proto.Unmarshal(stream, &ps)
+		if err == nil {
+			re.currentTerm.Store(ps.CurrentTerm)
+			re.votedFor.Store(ps.VotedFor)
+		}
+
+		return err
 	})
 
 	if err != nil {
 		if errors.Cause(err) == RaftErrorNodePersistentData {
 			// Let's initialise persisted state for the first time and save it.
-			re.CurrentTerm = -1
+			re.currentTerm.Store(termNotSet)
 			re.replaceTermIfNewer(0)
 			return nil
 		}
@@ -252,6 +292,8 @@ func (re *raftEngine) loadNodePersistedData() error {
 	if err != nil {
 		re.node.logger.Errorw("loading node persistent data, failed",
 			append(re.logKV(), raftErrKeyword, err)...)
+		re.node.signalFatalError(err)
+
 	}
 
 	return err
@@ -264,12 +306,39 @@ func (re *raftEngine) initLogDB(ctx context.Context, n *Node) error {
 	opts := *bolt.DefaultOptions
 	// Potential for overwriting options like fsync if persisted data does not matter.
 
-	ldb, err := bolt.Open(f, 0666, &opts)
+	n.logger.Debugw("opening bolt DB for persistence", n.logKV()...)
+	var ldb *bolt.DB
+	var err error
+
+	done := make(chan struct{})
+	go func() {
+		ldb, err = bolt.Open(f, 0666, &opts)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second): // catch bboltdb blocking on some other user locking the DB
+		err = raftErrorf(RaftErrorLockedBoltDB,
+			"loading bbolt DB for log entries blocked (is another process using the DB?)")
+		n.logger.Errorw("initialising DB for log entries", append(n.logKV(), raftErrKeyword, err)...)
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	if err != nil {
 		err = raftErrorf(err, "loading bbolt DB for log entries failed")
 		n.logger.Errorw("initialising DB for log entries", append(n.logKV(), raftErrKeyword, err)...)
 		return err
 	}
+
+	// We start by purging any preexisting log entries if they exist. Eventually we will use the persisted
+	// log for initial checkpoint, but not yet.
+	err = ldb.Update(func(tx *bolt.Tx) error {
+		tx.DeleteBucket([]byte(dbBucketLog))
+		return nil
+	})
 
 	err = ldb.Update(func(tx *bolt.Tx) error {
 		_, err = tx.CreateBucketIfNotExists([]byte(dbBucketLog))

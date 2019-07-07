@@ -47,10 +47,12 @@ message RequestTimeoutReply {
 
 message LogCommandRequest {
     bytes command = 1;
+    string origin = 2;
 }
 
 message LogCommandReply {
     bool ack = 1;
+    string reason = 2;
 }
 
 // AppNonce, a test message used in unit test which can be safely ignored.

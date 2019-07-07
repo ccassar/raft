@@ -7,8 +7,16 @@
 
 Yet another implementation of raft, in go.
 
-This package is intended to be embeddable in any application run as a cluster of coordinating instances and 
-wishing to benefit from a distributed replicated log of events.
+This raft package may be useful to any application run as a cluster of coordinating instances requiring a distributed
+replicated log of events. An identical sequence of events will be exposed to each member instance. Each member instance
+can contribute to that sequence. No third party system is required.
+
+Member instances can use the replicated log to drive a deterministic state machine: the result would be that all
+instances will arrive at the same state traversing the same sequence of states.
+
+The best (and only) place to start if you are planning to use this package is [package documentation here](https://godoc.org/github.com/ccassar/raft).
+Extensive examples are included, including how to setup TLS with mutual authentication to protect gRPC intra-cluster
+communication. The rest of this README.md is largely about the implementation of the package itself.
 
 The focus of this implementation is an all-batteries-included, production quality, extensively tested, complete
 implementation.
@@ -37,10 +45,9 @@ Reference to the above in code uses acronyms included above (i.e. CBTP, ARC, ISU
 
 For an excellent short presentation about Raft, see: https://www.usenix.org/node/184041
 
-
 Key assertions:
 
-- a raft node can be in one of three states: Follower, Candidate and Leader.
+- a raft node can be in one of three roles: Follower, Candidate and Leader.
 - log entries only ever flow from leader to followers.
 - a term will only ever have one leader.
 - followers never accept log entries from leaders on smaller term.
@@ -63,8 +70,7 @@ application. By default, the client and server are configured with aggressive ma
 and keepalive parameters and enforcement policy.
 
 Both the server side and client side are set up with prometheus and zap logging interceptors in order to
-provide consistent logging and metrics collection for gRPC calls. Note that RPC logging filters out anything other
-than request vote RPCs to avoid the cost on the more common AppendEntry messages. A `detailed` configuration option
+provide consistent logging and metrics collection for gRPC calls. A `detailed` configuration option
 [WithMetrics](https://godoc.org/github.com/ccassar/raft#WithLogger) under the control of the application determines 
 whether we track the latency distribution of RPC calls.
 
@@ -78,20 +84,45 @@ run with TLS enabled and with mutual authentication between server and client.
 ### Metrics
 
 The Raft package accepts a prometheus metrics registry and uses that to track key statistics of the Raft
- operation, including RPC metrics client and server side (using gRPC middleware interceptors).
+operation, including RPC metrics client and server side (using gRPC middleware interceptors). The WithMetrics can be
+called without a registry in which case metrics are collected against the default registry. If WithMetrics option is
+not setup, no metrics are collected.
 
 ### Logging
 
+Logging is primarily to three levels; Info which logs very minimally and captures very significant events like
+role (leader/follower/candidate) changes, Debug which is far more verbose, and Error.
+
+Logs are named `raft.NODE<node index>`. GRPC server and client message logs are named `raft.NODE<node index>.GRPC_<C|S>`
+so they can be easily filtered in or out. GRPC message logs are logged at debug level only. Log names are appended to
+whatever name the the application uses if it provides the log through `WithLogger` option.
+
 By default, the raft package will set up a customised production zap log: logging Info level and above,
-structured and JSON formatted, with sampling and caller disabled, and stacktrace enabled for errors. The logger
-field is set (using logger.Named()) to unambiguously indicate that logs are coming from raft package. Logs, by
-default, look like this:
+structured and JSON formatted, with sampling and caller disabled, and stacktrace enabled for errors, and logging
+to stdout. The logger field is set (using logger.Named()) to unambiguously indicate that logs are coming from raft
+package. Logs, by default, look like this:
 
 ```
-{"level":"info","ts":"2019-06-08T16:04:34.891+0100","logger":"raft","msg":"raft package, starting up (logging can be customised or disabled using WithLogger option)"}
-{"level":"info","ts":"2019-06-08T16:04:34.892+0100","logger":"raft","msg":"listener acquired local node address","obj":"localNode","nodeIndex":0,"address":":8088"}
-{"level":"info","ts":"2019-06-08T16:04:34.892+0100","logger":"raft","msg":"added remote node from configuration","obj":"remoteNode","nodeIndex":1,"address":":8089"}
-{"level":"info","ts":"2019-06-08T16:04:34.892+0100","logger":"raft","msg":"added remote node from configuration","obj":"remoteNode","nodeIndex":2,"address":":8090"}
+{"level":"info","ts":"2019-07-07T10:20:23.859+0100","logger":"raft.NODE0","msg":"raft package, hello (logging can be customised or disabled using WithLogger options)"}
+{"level":"info","ts":"2019-07-07T10:20:23.866+0100","logger":"raft.NODE0","msg":"raftEngine, start running","currentTerm":0,"commitIndex":0,"appliedIndex":0,"state":"not set","VotedFor":0,"currentLeader":-1}
+{"level":"info","ts":"2019-07-07T10:20:23.866+0100","logger":"raft.NODE0","msg":"ROLE CHANGE: from UNINIT to FOLLOWER","currentTerm":0,"commitIndex":0,"appliedIndex":0,"state":"follower","VotedFor":0,"currentLeader":-1}
+{"level":"info","ts":"2019-07-07T10:20:35.814+0100","logger":"raft.NODE0","msg":"ROLE CHANGE: from FOLLOWER to CANDIDATE","currentTerm":0,"commitIndex":0,"appliedIndex":0,"state":"candidate","VotedFor":0,"currentLeader":-1}
+{"level":"info","ts":"2019-07-07T10:20:35.818+0100","logger":"raft.NODE0","msg":"ROLE CHANGE: from CANDIDATE to LEADER","currentTerm":1,"commitIndex":0,"appliedIndex":0,"state":"leader","VotedFor":0,"currentLeader":0}
+```
+
+If the log encoding is set to `console` instead of `JSON` (unusual in production environments, but useful if looking
+at logs directly instead of through some log aggregating tool like Splunk or Elastic), then `Info` level logs look like
+this:
+
+```
+2019-07-07T16:05:33.104+0100	info	raft.NODE0	raft package, hello (logging can be customised or disabled using WithLogger options)
+2019-07-07T16:05:33.115+0100	info	raft.NODE0	raftEngine, start running	{"currentTerm": 0, "commitIndex": 0, "appliedIndex": 0, "state": "uninit", "VotedFor": 0, "currentLeader": -1}
+2019-07-07T16:05:33.115+0100	info	raft.NODE0	ROLE CHANGE: from UNINIT to FOLLOWER	{"currentTerm": 0, "commitIndex": 0, "appliedIndex": 0, "state": "follower", "VotedFor": 0, "currentLeader": -1}
+2019-07-07T16:05:45.064+0100	info	raft.NODE0	ROLE CHANGE: from FOLLOWER to CANDIDATE	{"currentTerm": 0, "commitIndex": 0, "appliedIndex": 0, "state": "candidate", "VotedFor": 0, "currentLeader": -1}
+2019-07-07T16:05:45.070+0100	info	raft.NODE0	ROLE CHANGE: from CANDIDATE to LEADER	{"currentTerm": 1, "commitIndex": 0, "appliedIndex": 0, "state": "leader", "VotedFor": 0, "currentLeader": 0}
+2019-07-07T16:05:45.187+0100	info	raft.NODE0	application is requesting a shutdown
+2019-07-07T16:05:45.187+0100	info	raft.NODE0	raftEngine, stop running	{"currentTerm": 1, "commitIndex": 0, "appliedIndex": 0, "state": "leader", "VotedFor": 0, "currentLeader": 0}
+2019-07-07T16:05:45.187+0100	info	raft.NODE0	raft package, goodbye
 ```
 
 Raft logging is customisable in the MakeNode call, application controls logger through the WithLogging option.
@@ -104,9 +135,10 @@ in raft package, modify it based on application need, and activate it.
 Errors returned from the raft package across APIs attempt to provide the necessary context to
 clarify the circumstances leading to the error (in the usual form of a string returned via Error()
 method on error). The same error can also be squeezed for a root cause using the errors.Cause()
-method. If the root cause is internal to raft, then the sentinel error will be one of those defined
-[here](raft_errors.go) and can be tested programmatically. If the root cause originated in some package
-downstream of raft, then the downstream error is propagated explicitly. Godoc documentation includes an
+method to support programmatic handling of the error if required. If the root cause is internal to raft,
+then the sentinel error will be one of those defined [here](raft_errors.go) and can be tested
+programmatically. If the root cause originated in some package downstream of raft, then the downstream
+error is propagated explicitly. Godoc documentation includes an
 [example](https://godoc.org/github.com/ccassar/raft#example-MakeNode) of how the errors can be handled 
 programmatically. In essence:
 
@@ -136,12 +168,14 @@ Lots to go, but do come inside and have a look.
 Done so far:
 
  - General package infra: gRPC client and server setup, logging, metrics, UT
+ - Leadership election
+ - Log replication
 
-In progress;
+Todo next:
 
-- election state machine; UT
-- move client to notify and pull for AppendEntry
-- pick up localLogCommandChan in all states with push back if channel to client is full.
+ - election: only basic testing so far; extend scenarios covered
+ - replication: basic and extended testing
+ - graceful handover on leader before shutdown
 
 Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
 guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
@@ -154,7 +188,7 @@ and the directory hosting protoc should be in the PATH. Running `go generate` wi
 generated source.
 
 
-### Raw Design Notes
+### Implementation Notes
 
 The figure below represents the main components in the raft package and the interactions with the application.
 
@@ -170,6 +204,47 @@ Client side recovers by pulling when channel starts to drain. This constraint sh
 because this is what ensures that we never livelock with client goroutine pushing to raftEngine, and raftEngine
 trying to push to raftEngine. 
 
+#### Notes about Flows
+
+The life-of-a-packet for various paths through the system...
+
+##### Application learns about newly committed log command from raft package:
+    Trigger: load a new commitIndex. This could happen when we learn of new commit index as followers from a leader,
+    or as a leader when an acknowledgement for an AppendEntry update is received.
+    Action: the local publisher is notified (assuming a notification is not pending already). The local publisher
+    strives to keep the local application in sync with committed log commands.
+
+##### Application pushes new log command on follower node:
+    Trigger: application pushes log command to log producer via LogProduce(). Log producer hands off logCommandContainer
+    to raftEngine and blocks waiting for response on response channel. This means we will only have one cmd log in flight
+    at any one point if the client serialises calls to LogProduce. (Eventually we may publish results asynchronously to
+    improve performance.) 
+    Action: raftEngine hands the logCommandContainer to the client for the leader on the logCommand channel as a
+    logCmdEvent . The log command is propagated to the leader over gRPC and handled there. The entries are added to the
+    log. And ack tracker is setup to watch for when the committedIndex moves to this index. When that happens the tracker
+    will acknowledge which will release the response to the remote node. When the result is received at the originating
+    node for the producing application, it is passed back to the log producer and the application through the return
+    channel in the logCommandContainer. In the case where the log command was sourced locally to the leader, then the
+    acker will feed the acknowledgement directly to the logProducer and the application.
+
+##### raftEngine receives a new log command on leader node:
+    Trigger: remote (or local) logCommand message with new log command.
+    Action: raftEngine installs the new log command in the log, and notifies clients (if no notification is pending)
+    one by one. Clients will pull and doggedly attempt to get the missing log commands to the remote nodes. raftEngine
+    leader tracks client matchIndex and nextIndex. Any rejections received for AppendEntry messages reset the next
+    index. When a node becomes a leader it assumes that followers are in sync by setting the nextIndex to one ahead of
+    index of last entry in log on leader. The keepalive includes the latest prevLogIndex and prevLogTerm. Followers
+    which are not in sync, will nak the keepalive resulting in their nextIndex being rolled back to hunt for common
+    point in log between leader and follower.
+    
+     
+#### Unrecoverable Errors
+
+When the raft packages encounters failures which are unrecoverable; e.g. persisted content it can not unmarshal, or
+persistent store failure, raft package signals catastrophic failure to the application. The expectation is that the
+application does what is necessary and appropriate to draw operator attention (e.g. shutdown).
+
+
 #### Concurrency and Synchronisation
 
 The package uses multiple goroutines;
@@ -179,11 +254,11 @@ The package uses multiple goroutines;
  delivers the response back to the raft engine thread.
  - grpc servers handling RPCs initiated by remote nodes in the cluster
  - the central goroutine handles the raft state machine. Messages received from other goroutines and timer events are
- the main inputs to the state machine.
+   the main inputs to the state machine. This goroutine never blocks on other go routines. This way we make reasoning
+   about concurrency in raft package a little less painful, and ensure we avoid deadlocks.
  - while in leader state, an independent go routine handles acknowledging log command requests from local or remote
    applications when the log command is committed.
  - an application facing goroutine is responsible for feeding the channel of 'applied' log entries to the application.
   
-Synchronisation is mostly lock free and largely message passing based. Other synchronisation primitives used include atomic
-updates to track when channels between raft engine and gRPC client goroutines should be flushed. The acker shares the list
-of pending acknowledgement with the raftEngine. 
+Synchronisation is mostly lock free and largely message passing based. Other synchronisation primitives used include
+atomic updates and mutexes held briefly in leaf functions.

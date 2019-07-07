@@ -25,7 +25,7 @@ type raftLogAcknowledger struct {
 	updatesAvailable chan struct{}
 	// pendingAcks tracks pending acknowledgements. This slice is added to by the raftEngine when it receives
 	// new log commands through trackPEndingAck call, and is drained from the front by this ack generator. No
-	// need for read/write mutex since we only have a reader and a writer contending for the resource.
+	// need for read/write mutex since we only have one reader and one writer contending for the resource.
 	pendingAcksMu sync.Mutex
 	pendingAcks   []*logCommandPendingAck
 }
@@ -51,7 +51,7 @@ func (acker *raftLogAcknowledger) run(ctx context.Context, wg *sync.WaitGroup, l
 
 	defer wg.Done()
 
-	lg.Info("raftLogAcknowledger, start running")
+	lg.Debug("raftLogAcknowledger, start running")
 
 outerLoop:
 	for {
@@ -103,7 +103,10 @@ outerLoop:
 			}
 
 		case <-ctx.Done():
-			// We are shutting down or demoted from leader. Nak any remaing pending entries, and leave.
+
+			// We are shutting down or demoted from leader. Nak any remaining pending entries, and leave.
+			lg.Debug("raftLogAcknowledger, received shutdown (or resigning from leader)")
+
 			acker.pendingAcksMu.Lock()
 			var pendingFrom, pendingTo int64
 			pending := len(acker.pendingAcks)
@@ -129,7 +132,7 @@ outerLoop:
 		}
 	}
 
-	lg.Info("raftLogAcknowledger, stop running")
+	lg.Debug("raftLogAcknowledger, stop running")
 }
 
 // createLogAcknowledgerAndRun is typically called by the leader to set up its acknowledger.

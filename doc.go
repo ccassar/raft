@@ -10,16 +10,17 @@ For an overview of the package, and the current state of the implementation, see
 Embedding Raft Package, Initialisation
 
 The code to embed and initialise a local raft instance is straightforward. Numerous examples are included. The common
-pattern of the variations presented in the examples is as follows:
+pattern across examples goes like this:
 
-The key function called is MakeNode. MakeNode will setup the local node to communicate with the rest of the remote
-nodes in the cluster. MakeNode takes a configuration block in the form of NodeConfig. All the fields in NodeConfig
-must be set.
+MakeNode() is called to fire up the local node. MakeNode will setup the local node to communicate with the rest of the
+remote nodes in the cluster. MakeNode takes a mandatory configuration block in the form of NodeConfig. All the fields in
+NodeConfig must be set.
 
 NodeConfig primarily dictates the composition of the remote cluster, the location of the boltdb file where logs and
-metadata are persisted, and the channel to use to communicate committed log commands to the application. MakeNode also
-takes a series of options; these options control, for example, whether and how to protect intra-cluster gRPC
-communication, logging and metrics collection.
+metadata are persisted, and the channel to use to communicate committed log commands to the application.
+
+MakeNode also takes a series of options; these options control, for example, whether and how to protect intra-cluster
+gRPC communication, logging and metrics collection.
 
 The code to run the local node (without TLS protection) for a three node cluster with default logging, and metrics
 registered against the default prometheus registry would look like this:
@@ -27,10 +28,11 @@ registered against the default prometheus registry would look like this:
  var wg sync.WaitGroup
  ctx, cancel := context.WithCancel(context.Background())
 
- cfg := NewNodeConfig()
- cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
- cfg.LogDB = "/data/myboltdbfile"
- cfg.LogCmds = make(chan []byte, 32)
+ cfg := NodeConfig{
+ 	Nodes: []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+ 	LogDB: "/data/myboltdbfile",
+ 	LogCmds: make(chan []byte, 32),
+ }
 
  // index 2 suggests we are running node3.example.com.
  node, err := MakeNode(ctx, &wg, cfg, 2, WithMetrics(nil, true))
@@ -57,9 +59,9 @@ registered against the default prometheus registry would look like this:
  wg.Wait()
 
 
-Slightly more complicated setup is involved in order to set up TLS with mutual authentication. It is of course possible
-to set up variations in between; e.g. where client verifies server certificate, but server does not validate client, or even,
-skip certificate verification on both sides. The changes involve setting up a function to return the gRPC server
+Slightly more is required in order to set up TLS with mutual authentication. It is of course possible
+to set up variations in between; e.g. where client verifies server certificate, but server does not validate client,
+or even, skip certificate verification on both sides. The changes involve setting up a function to return the gRPC server
 options on request, and similarly for the client options. Note that in the client options callback, we return a remote
 server name for dial options of a connection from a client to a server. This server name would be expected to match
 Common Name in X509 certificate. (Note how in the example we are mapping from the cluster node name we specify in the

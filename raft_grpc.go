@@ -9,7 +9,7 @@ import (
 	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
 	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/atomic"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
@@ -110,7 +110,7 @@ func (s *raftServer) ApplicationLoopback(ctx context.Context, in *raft_pb.AppNon
 }
 
 func (s *raftServer) logKV() []interface{} {
-	return []interface{}{"obj", "localNodeServer", "localNodeIndex", s.node.index, "address", s.localAddr}
+	return []interface{}{"obj", "localNodeServer", "address", s.localAddr}
 }
 
 func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
@@ -122,17 +122,11 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	unaryInterceptorChain := []grpc.UnaryServerInterceptor{
 		grpc_ctxtags.UnaryServerInterceptor(),
 		grpc_zap.UnaryServerInterceptor(
-			n.logger.Desugar(),
-			grpc_zap.WithDecider(func(fullMethodName string, err error) bool {
-
-				// Skip logging AppendEntry logs which could be large, and include possibly sensitive
-				// end user data.
-				if fullMethodName != "/raft.RaftService/AppendEntry" {
-					return true
-				}
-
-				return false
-			})),
+			n.logger.Named("GRPC_S").Desugar(),
+			// All results are forced to debug level
+			grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel })),
+		// We could filter which messages are logged using WithDecider option. Eventually, we may
+		// expose this (and client side equivalent) as an option for application to control.
 	}
 
 	if n.messaging.serverUnaryInterceptorForMetrics != nil {
@@ -166,12 +160,12 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	reflection.Register(s.grpcServer)
 	raft_pb.RegisterRaftServiceServer(s.grpcServer, s)
 
-	n.logger.Infow("gRPCServer starting up", s.logKV()...)
+	n.logger.Debugw("gRPCServer starting up", s.logKV()...)
 
 	go func() {
 		select {
 		case <-ctx.Done():
-			n.logger.Infow("gRPCServer graceful shut down requested", s.logKV()...)
+			n.logger.Debugw("gRPCServer graceful shut down requested", s.logKV()...)
 			s.grpcServer.GracefulStop()
 		}
 	}()
@@ -187,9 +181,9 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 				"gRPC Server exit", append(s.logKV(), raftErrKeyword, err, "retryIn", next.String())...)
 		})
 	if err != nil {
-		n.logger.Infow("gRPCServer shut down unexpectedly", append(s.logKV(), raftErrKeyword, err)...)
+		n.logger.Errorw("gRPCServer shut down unexpectedly", append(s.logKV(), raftErrKeyword, err)...)
 	} else {
-		n.logger.Infow("gRPCServer shut down gracefully", s.logKV()...)
+		n.logger.Debugw("gRPCServer shut down gracefully", s.logKV()...)
 	}
 }
 
@@ -216,7 +210,7 @@ func initServer(ctx context.Context, n *Node) error {
 		}
 
 		n.messaging.server = s
-		n.logger.Infow("listener acquired local node address", s.logKV()...)
+		n.logger.Debugw("listener acquired local node address", s.logKV()...)
 
 	} else {
 
@@ -230,13 +224,11 @@ func initServer(ctx context.Context, n *Node) error {
 	return nil
 }
 
-// The raft client is very mechanical and simple. Its role is simply to offload the blocking gRPC calls. Every
-// event posted by the core raft component over the eventChannel is acknowledged with a return event - no ifs,
-// no buts... always.
+// The raft client is very mechanical and simple. Its role is simply to offload the blocking gRPC calls. In some cases
+// events posted by the core raft component over the channel is acknowledged with a return event. In other cases,
+// the event handler is more sophisticated - e.g. AppendEntry events are just wake-up notifications which then
+// result in the event handler, in the context of the client go routine, pulling and producing updates on demand.
 //
-// Note: if client is for a leader, it will be sent an AppendEntryRequest with no log message, every heartbeat
-// period if the appendEntryChannel is empty; otherwise we consider an AppendEntryRequest is scheduled already
-// so there is no need for an empty one to be sent.
 type raftClient struct {
 	// Cache the parent node so we can navigate up as necessary.
 	node *Node
@@ -247,35 +239,14 @@ type raftClient struct {
 	remoteAddress string
 	// grpcClient tracks the grpcClient, and is only accessed in the run goroutine for the client.
 	grpcClient raft_pb.RaftServiceClient
-	// eventChannel is consumed in the run goroutine of the client, and produced too from the core
-	// raft.
-	eventChannel chan event
-	//
-	// The following field is the one field which can be written from both sides of the channel - specifically
-	// incremented and, exceptionally, decremented on the producer side and decremented on the consumer side. We use
-	// a lock free atomic operation to set and clear flush. Any nonzero values for flush results in a noop on the
-	// consumer side (except for flush undo events).
-	flush *atomic.Int32
+	// flushable event channel receives all events that need disposing of. Event will carry all the context
+	// required to communicate with remote node and handle response. The client is as thin as can be and
+	// a simple way to enable async handling of events.
+	eventChan flushableEventChannel
 }
 
 func (c *raftClient) logKV() []interface{} {
 	return []interface{}{"obj", "remoteNodeClient", "remoteNodeIndex", c.index, "address", c.remoteAddress}
-}
-
-// Figure out whether an event (eligible for discard) should be discarded. Only events not eligible for discard
-// are wrapper events which manage flush (i.e. eventFlushUndo).
-func (c *raftClient) discardEligibleEvent() bool {
-	return c.flush.Load() != 0
-}
-
-//
-// Increment/Decrement flush on client. This can be called from both side of eventChannel.
-func (c *raftClient) updateFlush(up bool) {
-	if up {
-		c.flush.Inc()
-	} else {
-		c.flush.Dec()
-	}
 }
 
 // raftClient.run is a per remote node goroutine which will maintain a gRPC client connection to the remote node,
@@ -283,20 +254,14 @@ func (c *raftClient) updateFlush(up bool) {
 func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	defer wg.Done()
 
-	n.logger.Infow("remote node client worker start running", c.logKV()...)
+	n.logger.Debugw("remote node client worker start running", c.logKV()...)
 
-	// Add grpc client interceptor for logging, and metrics collection (if enabled).
-
+	// Add grpc client interceptor for logging, and metrics collection (if enabled). We do not use payload logging
+	// because it is currently nailed to InfoLevel.
+	gcl := n.logger.Named("GRPC_C").Desugar()
 	unaryInterceptorChain := []grpc.UnaryClientInterceptor{
-		grpc_zap.PayloadUnaryClientInterceptor(
-			n.logger.Desugar(), func(ctx context.Context, fullMethodName string) bool {
-				//
-				// Do not log AppendEntry
-				if fullMethodName != "/raft.RaftService/AppendEntry" {
-					return true
-				}
-				return false
-			})}
+		grpc_zap.UnaryClientInterceptor(
+			gcl, grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel }))}
 
 	if n.messaging.clientUnaryInterceptorForMetrics != nil {
 		unaryInterceptorChain = append(unaryInterceptorChain, n.messaging.clientUnaryInterceptorForMetrics)
@@ -330,57 +295,25 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	defer conn.Close()
 
-	n.logger.Infow("remote node client worker connected",
+	n.logger.Debugw("remote node client worker connected",
 		append(c.logKV(), "connState", conn.GetState().String())...)
 	c.grpcClient = raft_pb.NewRaftServiceClient(conn)
 
 	for {
 		select {
-
-		case e := <-c.eventChannel:
+		case e := <-c.eventChan.channel:
 			// The event handler carries all the context necessary, and equally handles the
 			// feedback based on the outcome of the event.
 			e.handle(ctx)
 
 		case <-ctx.Done():
 			// We're done. By this point we will have cleaned up and we're ready to go.
-			n.logger.Infow("remote node client worker shutting down", c.logKV()...)
+			n.logger.Debugw("remote node client worker shutting down", c.logKV()...)
 			return
 		}
+
 	}
 
-}
-
-// Post a message to the client indicating whether we succeeded or not. This is a non-blocking call. If the clients
-// channel is full we will not block and hang around, but return with an indication that we failed to pass on the
-// event.
-func postMessageToClient(ctx context.Context, client *raftClient, e event) bool {
-
-	select {
-	case client.eventChannel <- e:
-	default:
-		// we will indicate we failed to send if channel is full. Based on the nature of the event,
-		// caller will handle how to recover. Note that this makes this function completely non blocking.
-		return false
-	}
-
-	return true
-}
-
-// Post a message to a client. The message posted this way, will cause all discard elegible messages ahead in the channel
-// to be discarded.
-func postMessageToClientWithFlush(ctx context.Context, client *raftClient, e event) bool {
-
-	// LeaderId this point on, client starts to discard messages.
-	client.flush.Inc()
-	wrapper := &eventFlushUndo{wrappedEvent: e, client: client}
-
-	if !postMessageToClient(ctx, client, wrapper) {
-		client.flush.Dec()
-		return false
-	}
-
-	return true
 }
 
 func initClients(ctx context.Context, n *Node) error {
@@ -402,13 +335,12 @@ func initClients(ctx context.Context, n *Node) error {
 				node:          n,
 				index:         int32(i),
 				remoteAddress: remoteNodeAddress,
-				// Event channel is how the core of the raft communicates with a gRPC client to the remote node
-				// associated with this client.
-				eventChannel: make(chan event, n.config.channelDepth.clientEvents),
-				flush:        atomic.NewInt32(0),
+				// Event channels is how the core of raft communicates with a gRPC client to the remote node
+				// associated with this client. The event itself carries all the handling context.
+				eventChan: NewFlushableEventChannel(n.config.channelDepth.clientEvents),
 			}
 			clients[int32(i)] = client
-			n.logger.Infow("added remote node from configuration", client.logKV()...)
+			n.logger.Debugw("added remote node from configuration", client.logKV()...)
 
 		}
 	}
@@ -431,6 +363,8 @@ type raftMessaging struct {
 // initMessaging sets up both client workers used to push messages to cluster nodes, and server side handling of
 // messages sent to the local instance.
 func initMessaging(ctx context.Context, n *Node) error {
+
+	n.logger.Debugw("raftMessaging, initialising", n.logKV()...)
 
 	if n.messaging.grpcLogging {
 		// Not quite from init functions because we let user control it, but early on enough.

@@ -16,11 +16,17 @@ import (
 	"google.golang.org/grpc/credentials"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+const testMetricsBasePort = 9001
+const testMetricNamespace = "raftTest"
 
 func TestMakeNode(t *testing.T) {
 
@@ -43,7 +49,7 @@ func TestMakeNode(t *testing.T) {
 
 	// Setup prometheus endpoint on default registry.
 	http.Handle("/metrics", promhttp.Handler())
-	promEndpoint := ":8000"
+	promEndpoint := ":8002"
 	go http.ListenAndServe(promEndpoint, nil)
 
 	testCases := []struct {
@@ -110,7 +116,7 @@ func TestMakeNode(t *testing.T) {
 		{
 			"Exercise WithMetrics option(default registry)",
 			nodeCfgs,
-			[]NodeOption{WithMetrics(nil, true)},
+			[]NodeOption{WithMetrics(nil, "", true)},
 			true,
 			evalForApplicationLoopback,
 		},
@@ -128,7 +134,7 @@ func TestMakeNode(t *testing.T) {
 			for i := range tc.cfg {
 				wg.Add(1)
 				n, err := MakeNode(ctx, &wg, tc.cfg[i], int32(i),
-					append(tc.opts, WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false))...)
+					append(tc.opts, WithLogger(l, false))...)
 				if (err == nil) != tc.ok {
 					t.Fatalf("%s, expected [%t], got [%v]", tc.name, tc.ok, err)
 				}
@@ -142,7 +148,7 @@ func TestMakeNode(t *testing.T) {
 
 			if tc.ok { // no point scraping metrics if we do not expect MakeNode to succeed.
 				t.Log("Metrics from all node")
-				t.Log(testScrapeMetrics("http://:8000/metrics"))
+				t.Log(testScrapeMetrics(1, "/metrics"))
 			}
 
 			cancel()
@@ -183,9 +189,10 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		":8082": "server2",
 	}
 
-	nc := NewNodeConfig()
-	nc.Nodes = []string{":8080", ":8081", ":8082"}
-	nc.LogCmds = make(chan []byte)
+	nc := NodeConfig{
+		Nodes:   []string{":8080", ":8081", ":8082"},
+		LogCmds: make(chan []byte),
+	}
 
 	clientDialOptionsFn := func(local, remote string) []grpc.DialOption {
 		tlsCfg := &tls.Config{
@@ -213,8 +220,7 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 	metricsServer := make([]*http.Server, len(nc.Nodes))
 
 	for i := 0; i < len(nc.Nodes); i++ {
-		metricsReg[i], metricsServer[i] = testSetupMetricsRegistryAndServer(
-			fmt.Sprintf(":%d", 8001+i), "/metrics")
+		metricsReg[i], metricsServer[i] = testSetupMetricsRegistryAndServer(int32(i), "/metrics")
 
 		nc.LogDB = fmt.Sprintf("test/boltdb.%d", i)
 		wg.Add(1)
@@ -222,7 +228,7 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 			WithClientDialOptionsFn(clientDialOptionsFn),
 			WithServerOptionsFn(serverOptionsFn),
 			WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false),
-			WithMetrics(metricsReg[i], true))
+			WithMetrics(metricsReg[i], "", true))
 
 		if err != nil {
 			t.Fatalf("%s, expected ok, got [%v]", t.Name(), err)
@@ -237,7 +243,7 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 
 	for i := 0; i < len(nc.Nodes); i++ {
 		t.Log("Metrics from node: ", nodes[i].logKV())
-		t.Log(testScrapeMetrics(fmt.Sprintf("http://:%d/metrics", 8001+i)))
+		t.Log(testScrapeMetrics(int32(i), "/metrics"))
 		metricsServer[i].Shutdown(ctx)
 	}
 
@@ -334,32 +340,150 @@ func TestWrapperErrorRendering(t *testing.T) {
 	fmt.Printf("detail rendering: %+v\n", err)
 }
 
-func TestElectionFollowerCandidate(t *testing.T) {
+type testNode struct {
+	nc     NodeConfig
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	node   *Node
+}
+
+func testAddNode(nodes []string, i int) (*testNode, error) {
+	return testAddNodeWithDB(nodes, i, "")
+}
+
+func testAddNodeWithDB(nodes []string, i int, db string) (*testNode, error) {
+
+	var err error
+
+	var tn testNode
 
 	l := testLoggerGet()
 
-	nc := NodeConfig{
-		Nodes:   []string{":8088", ":8089", ":8090"},
-		LogDB:   "test/boltdb.0",
-		LogCmds: make(chan []byte)}
+	if db == "" {
+		db = fmt.Sprintf("test/boltdb.%d", i)
+	}
 
-	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	tn.nc = NodeConfig{
+		Nodes:   nodes,
+		LogDB:   db,
+		LogCmds: make(chan []byte),
+	}
 
-	wg.Add(1)
-	_, err := MakeNode(ctx, &wg, nc, 0,
+	tn.ctx, tn.cancel = context.WithCancel(context.Background())
+
+	registry, metricsServer := testSetupMetricsRegistryAndServer(int32(i), "/metrics")
+	go func() {
+		<-tn.ctx.Done()
+		metricsServer.Shutdown(context.Background())
+	}()
+
+	tn.wg.Add(1)
+	tn.node, err = MakeNode(tn.ctx, &tn.wg, tn.nc, int32(i),
 		WithLogger(l, false),
-		WithLeaderTimeout(time.Second),
-		WithChannelDepthToClientOffload(64))
+		WithLeaderTimeout(time.Millisecond*500),
+		WithChannelDepthToClientOffload(64),
+		WithMetrics(registry, testMetricNamespace, false))
+
+	return &tn, err
+}
+
+func TestDetectBlockedBoltDB(t *testing.T) {
+
+	nodes := []string{":8088", ":8089", ":8090"}
+	_, err := testAddNodeWithDB(nodes, 0, "test/boltdb.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = testAddNodeWithDB(nodes, 1, "test/boltdb.0")
+	if err == nil {
+		t.Fatal("expected reused bbolt DB to force an error")
+	}
+
+	if errors.Cause(err) != RaftErrorLockedBoltDB {
+		t.Fatal("expected reused bbolt DB to force an error, but error returned is not expected one", err)
+	}
+
+}
+
+func TestElection(t *testing.T) {
+
+	nodeCount := 3
+	for i := 0; i < nodeCount; i++ {
+		os.Remove(fmt.Sprintf("test/boltdb.%d", i))
+	}
+
+	n := make([]*testNode, nodeCount)
+	nodes := []string{":8088", ":8089", ":8090"}
+	var err error
+
+	// Bring up the first node.
+	fmt.Println("Bring up 0")
+	n[0], err = testAddNode(nodes, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	//TODO Extensive Election Testing
-	time.Sleep(time.Second * 5)
-	cancel()
-	wg.Wait()
+	fmt.Println("Bring up 1")
+	n[1], err = testAddNode(nodes, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	findNewLeader := func() int {
+		var whoIsLeader int
+		for {
+			leader := 0
+			for i := 0; i < nodeCount; i++ {
+				if n[i] != nil {
+					results := testScrapeMetricsAndExtract(int32(i), "/metrics",
+						[]string{fmt.Sprintf("%s_raft_role", testMetricNamespace)})
+					if len(results) == 1 {
+						if results[0].val == "3" {
+							whoIsLeader = i
+							leader++
+						}
+					}
+				}
+			}
+			if leader == 1 {
+				break // we're done; we converged to 1 node
+			}
+			time.Sleep(time.Second)
+		}
+
+		fmt.Println("LEADER: ", whoIsLeader)
+		return whoIsLeader
+	}
+
+	whoIsLeader := findNewLeader()
+
+	//
+	// Bring up new node...
+	fmt.Println("Bring up 2")
+	n[2], err = testAddNode(nodes, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fmt.Println("Kill the current leader")
+	n[whoIsLeader].cancel()
+	n[whoIsLeader].cancel = nil
+
+	whoIsLeader = findNewLeader()
+	fmt.Println("Elected new leader")
+
+	for i := 0; i < nodeCount; i++ {
+		if n[i] == nil {
+			continue
+		}
+		if n[i].cancel != nil {
+			fmt.Println("Cancelling: ", i)
+			n[i].cancel()
+		}
+		fmt.Println("Waiting for: ", i)
+		n[i].wg.Wait()
+	}
 
 }
 
@@ -372,11 +496,11 @@ func ExampleMakeNode() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.LogCmds = make(chan []byte, 32)
-	cfg.LogDB = "mydb.bbolt"
-
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
 	wg.Add(1)
 	localIndex := int32(2) // say, if we are node3.example.com
 	n, err := MakeNode(ctx, &wg, cfg, localIndex)
@@ -428,10 +552,11 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.LogCmds = make(chan []byte, 32)
-	cfg.LogDB = "mydb.bbolt"
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
 
 	loggerCfg := DefaultZapLoggerConfig()
 	logger, err := loggerCfg.Build( /* custom options can be provided here */ )
@@ -485,10 +610,11 @@ func ExampleMakeNode_withTLSConfiguration() {
 
 	// We setup a configuration to enforce authenticating TLS client connecting to this node, and to validate
 	// server certificate in all client connections to remove cluster nodes.
-	nc := NewNodeConfig()
-	nc.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	nc.LogCmds = make(chan []byte, 32)
-	nc.LogDB = "mydb.bbolt"
+	nc := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
 
 	clientDialOptionsFn := func(local, remote string) []grpc.DialOption {
 		tlsCfg := &tls.Config{
@@ -548,13 +674,13 @@ func ExampleMakeNode_withDefaultMetricsRegistry() {
 		// handle err
 	}
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.LogCmds = make(chan []byte, 32)
-	cfg.LogDB = "mydb.bbolt"
-
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
 	_, err = MakeNode(ctx, &wg, cfg, 1, // say if we are node2.example.com
-		WithMetrics(nil, true),
+		WithMetrics(nil, "appFoo", true),
 		WithLogger(l, false))
 	if err != nil {
 		// handle error...
@@ -577,17 +703,18 @@ func ExampleMakeNode_withDedicatedMetricsRegistry() {
 		// handle err
 	}
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.LogCmds = make(chan []byte, 32)
-	cfg.LogDB = "mydb.bbolt"
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
 
 	myregistry := prometheus.NewRegistry()
 	// Do remember to serve metrics by setting up the server which serves the prometheus handler
 	// obtained by handler := promhttp.HandlerFor(myregistry, promhttp.HandlerOpts{})
 
 	_, err = MakeNode(ctx, &wg, cfg, 1, // say we are node2.example.com
-		WithMetrics(myregistry, true),
+		WithMetrics(myregistry, "appFoo", true),
 		WithLogger(l, false))
 	if err != nil {
 		/// handle error
@@ -672,7 +799,7 @@ func evalForApplicationLoopback(ctx context.Context, nodes []*Node) error {
 				client:  cl,
 				done:    make(chan struct{}),
 				request: &raft_pb.AppNonce{Nonce: 9898989}}
-			cl.eventChannel <- &e
+			cl.eventChan.channel <- &e
 			select {
 			case <-time.After(time.Second * 5):
 				err := fmt.Errorf("ApplicationLoopback to %s timed out", cl.remoteAddress)
@@ -727,7 +854,7 @@ func evalConnectedClients(ctx context.Context, nodes []*Node) error {
 			// Identify whether we got past blocking connection for client by posting an event.
 			// On each node, if every connection is up, we should see expect number of hits on event.
 			select {
-			case cl.eventChannel <- &e:
+			case cl.eventChan.channel <- &e:
 			case <-time.After(time.Second):
 				return fmt.Errorf("At node %d, connection %d failed with timeout posting event",
 					n.index, cl.index)
@@ -742,24 +869,65 @@ func evalConnectedClients(ctx context.Context, nodes []*Node) error {
 	return nil
 }
 
-func testScrapeMetrics(url string) string {
+func testScrapeMetrics(index int32, path string) string {
+
+	url := fmt.Sprintf("http://localhost:%d%s", testMetricsBasePort+index, path)
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Sprint("FAILED TO SCRAPE METRICS ", url, err)
+		return fmt.Sprintf("FAILED TO GET METRICS url %s, err %v", url, err)
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 
 	if err != nil {
-		return fmt.Sprint("FAILED TO SCRAPE METRICS ", url, err)
+		return fmt.Sprintf("GET METRICS FROM %s RECEIVED ERROR %v", url, err)
 	}
 	return string(body)
 }
 
-func testSetupMetricsRegistryAndServer(endpoint, path string) (*prometheus.Registry, *http.Server) {
+// Manual parsing of results looking for metrics of interest.
+type scrapedMetric struct {
+	name   string
+	val    string
+	labels string
+}
 
-	// Setup prometheus endpoint on default registry.
+var testImmutableMetricsRegexp = regexp.MustCompile(`^([a-zA-Z0-9_:]*){([a-zA-Z0-9_:="]*)} (\w+)$`)
+
+func testScrapeMetricsAndExtract(index int32, path string, metrics []string) []*scrapedMetric {
+
+	metricsMap := map[string]bool{}
+	for _, m := range metrics {
+		metricsMap[m] = true
+	}
+
+	out := testScrapeMetrics(index, path)
+	lines := strings.Split(out, "\n")
+	var result []*scrapedMetric
+	for _, line := range lines {
+		// fmt.Println(line)
+		loc := testImmutableMetricsRegexp.FindSubmatch([]byte(line))
+		if len(loc) == 4 {
+			// (full match) metricName, labels, value
+			_, ok := metricsMap[string(loc[1])]
+			if ok {
+				result = append(result, &scrapedMetric{
+					name:   string(loc[1]),
+					val:    string(loc[3]),
+					labels: string(loc[2]),
+				})
+			}
+		}
+	}
+	return result
+}
+
+func testSetupMetricsRegistryAndServer(index int32, path string) (*prometheus.Registry, *http.Server) {
+
+	endpoint := fmt.Sprintf("localhost:%v", testMetricsBasePort+index)
+
+	// Setup prometheus endpoint on new registry.
 	metricsReg := prometheus.NewRegistry()
 	handler := promhttp.HandlerFor(metricsReg, promhttp.HandlerOpts{})
 
@@ -769,7 +937,13 @@ func testSetupMetricsRegistryAndServer(endpoint, path string) (*prometheus.Regis
 		Addr:    endpoint,
 		Handler: handlerMux,
 	}
-	go metricServer.ListenAndServe()
+
+	go func() {
+		err := metricServer.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			panic(err)
+		}
+	}()
 
 	return metricsReg, metricServer
 }
@@ -777,7 +951,8 @@ func testSetupMetricsRegistryAndServer(endpoint, path string) (*prometheus.Regis
 func testLoggerGet() *zap.Logger {
 
 	loggerCfg := DefaultZapLoggerConfig()
-	loggerCfg.Level.SetLevel(zapcore.DebugLevel)
+	loggerCfg.Encoding = "console"
+	loggerCfg.Level.SetLevel(zapcore.InfoLevel)
 	logger, _ := loggerCfg.Build()
 
 	return logger

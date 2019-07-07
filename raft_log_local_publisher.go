@@ -36,7 +36,7 @@ func (pub *raftLogPublisher) run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	re := pub.engine
-	re.node.logger.Infow("raftLogPublisher, start running", pub.logKV()...)
+	re.node.logger.Debugw("raftLogPublisher, start running", pub.logKV()...)
 
 outerLoop:
 	for {
@@ -50,8 +50,8 @@ outerLoop:
 			count := 0
 			target := re.commitIndex.Load()
 			for index := re.lastApplied.Load() + 1; index <= target; index++ {
-				// We could retrieve a batch at a time here using logEntriesGet
-				le, err := re.logEntryGet(index)
+				// We could retrieve a batch at a time here using logGetEntries
+				le, err := re.logGetEntry(index)
 				if err != nil {
 					re.node.signalFatalError(err)
 					break outerLoop
@@ -72,5 +72,5 @@ outerLoop:
 		}
 	}
 
-	re.node.logger.Infow("raft log publisher, stop running", pub.logKV()...)
+	re.node.logger.Debugw("raft log publisher, stop running", pub.logKV()...)
 }

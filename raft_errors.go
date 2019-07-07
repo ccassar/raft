@@ -52,6 +52,10 @@ const RaftErrorBadLocalNodeIndex = Error(raftSentinel + "bad localNodeIndex opti
 // extract and test against sentinel.
 const RaftErrorServerNotSetup = Error(raftSentinel + "local server side not set up yet")
 
+// RaftErrorLockedBoltDB is the sentinel returned  (extracted using errors.Cause(err)) if
+// boltDB is locked by other process at startup.
+const RaftErrorLockedBoltDB = Error(raftSentinel + "local server side not set up yet")
+
 // RaftErrorClientConnectionUnrecoverable is the sentinel returned  (extracted using errors.Cause(err)) if
 // client gRPC connection to remote node failed. See ExampleMakeNode for an example of how to extract and test against
 // sentinel.
@@ -80,6 +84,18 @@ const RaftErrorNodePersistentData = Error(raftSentinel + "node persistent data f
 // RaftErrorLogCommandRejected is returned (extracted using errors.Cause(err)) if we fail to commit a log command
 // requested by the application. See ExampleMakeNode for an example of how to extract and test against sentinel.
 const RaftErrorLogCommandRejected = Error(raftSentinel + "log command failed to commit")
+
+// RaftErrorLogCommandLocalDrop is returned (extracted using errors.Cause(err)) if the local raft package drops
+// the log command before we even try to push it to the cluster leader.
+const RaftErrorLogCommandLocalDrop = Error(raftSentinel + "log command dropped locally, please retry")
+
+// RaftErrorMustFailed is returned (extracted using errors.Cause(err)) if the local raft package hits an assertion
+// failure. This will cause the raft package to signal a catastrophic failure and shut itself down
+const RaftErrorMustFailed = Error(raftSentinel + "raft internal assertion, shutting down local node")
+
+// raftErrorMismatchedTerm is returned (extract using errors.Cause(err)) within the raft package, and is used
+// to signal that a mismatched term has been detected in message from remote node.
+const raftErrorMismatchedTerm = Error(raftSentinel + "mismatched term")
 
 // raftErrorf is a simple wrapper which ensures that all raft errors are prefixed
 // consistently, and that we always either wrap a root cause error bubbling up from

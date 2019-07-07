@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -16,6 +17,7 @@ import (
 // application using the raft package. NodeConfig is passed in when starting up the node using MakeNode.
 // (Optional configuration can be passed in using WithX NodeOption options).
 type NodeConfig struct {
+	//
 	// Raft cluster node addresses. Nodes should include all the node addresses including the local one, in the
 	// form address:port. This makes configuration easy in that all nodes can share the same configuration.
 	//
@@ -58,16 +60,12 @@ type NodeConfig struct {
 		// election timeouts minimise the probability of split votes and resolves them quickly when they happen as
 		// described in Section 3.4 of CBTP. leaderTimeout defaults to 2s if not set.
 		leaderTimeout time.Duration
+		// gRPCTimeout is used to determine when we should give up on an attempt to invoke an RPC.
+		gRPCTimeout time.Duration
 	}
-}
-
-// NewNodeConfig returns a NodeConfig structure initialised with sensible defaults where possible. Caller,
-// will need to setup Nodes as a minimum before using NodeConfig in MakeNode.
-func NewNodeConfig() NodeConfig {
-
-	nc := NodeConfig{}
-
-	return nc
+	//
+	// Maximum size of batch of commands sent in AppendEntry. Defaults to 32 if not set.
+	logCmdBatchSize int32
 }
 
 const minNodesInCluster = 3
@@ -106,12 +104,20 @@ func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 		cfg.timers.leaderTimeout = time.Duration(2 * time.Second)
 	}
 
+	if cfg.timers.gRPCTimeout == 0 {
+		cfg.timers.gRPCTimeout = time.Duration(5 * time.Second)
+	}
+
 	if cfg.channelDepth.clientEvents == 0 {
 		cfg.channelDepth.clientEvents = 32
 	}
 
 	if cfg.channelDepth.serverEvents == 0 {
 		cfg.channelDepth.serverEvents = 32
+	}
+
+	if cfg.logCmdBatchSize == 0 {
+		cfg.logCmdBatchSize = 32
 	}
 
 	if cfg.LogDB == "" {
@@ -164,7 +170,7 @@ func (n *Node) logKV() []interface{} {
 		kv = append(kv, n.messaging.server.logKV()...)
 	}
 
-	kv = append(kv, "obj", "localNode", "localNodeIndex", n.index, "clients", len(n.messaging.clients),
+	kv = append(kv, "obj", "localNode", "clients", len(n.messaging.clients),
 		"fatalErrorCount", n.fatalErrorCount.Load())
 
 	return kv
@@ -185,6 +191,23 @@ func (n *Node) signalFatalError(err error) {
 		// if we get here it means that the channel is busy already - one fatal error is as good as many.
 		n.logger.Errorw("raft, skipped signalling fatal error, signalled already", raftErrKeyword, err.Error())
 	}
+}
+
+func (n *Node) mustGetClientFromId(clientIndex int32) *raftClient {
+	var rc *raftClient
+
+	defer func() {
+		if rc == nil {
+			n.signalFatalError(raftErrorf(
+				RaftErrorMustFailed, "fetching client %d expected to exist", clientIndex))
+		}
+	}()
+
+	if n != nil && n.messaging != nil {
+		rc = n.messaging.clients[clientIndex]
+	}
+
+	return rc
 }
 
 // NodeOption operator, operates on node to manage configuration.
@@ -217,15 +240,17 @@ func WithLogger(logger *zap.Logger, grpcLogToZap bool) NodeOption {
 	}
 }
 
-// WithMetrics option used with MakeNode to specify metrics registry we should count in. Detailed
-// option indicates whether detailed (and more expensive) metrics are tracked (e.g. grpc latency distribution).
+// WithMetrics option used with MakeNode to specify metrics registry we should count in. Argument namespace specifies
+// the namespace for the metrics. This is useful if the application prefixes all its metrics with a prefix. For
+// e.g. if namespace is 'foo', then all raft package metrics will be prefixed with 'foo.raft.'. Argument detailed
+// controls whether detailed (and more expensive) metrics are tracked (e.g. grpc latency distribution).
 // If nil is passed in for the registry, the default registry prometheus.DefaultRegisterer is used. Do note that
-// the package does not setup serving metrics; that is up to the application. The examples in godoc show how to
-// setup a custom metrics registry to log against. If the WithMetrics NodeOption is passed in to MakeNode, metrics
+// the package does not setup serving metrics; that is up to the application. Examples are included to show how to
+// setup a custom metrics registry to log against. If the WithMetrics NodeOption is NOT passed in to MakeNode, metrics
 // collection is disabled.
-func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
+func WithMetrics(registry *prometheus.Registry, namespace string, detailed bool) NodeOption {
 	return func(n *Node) error {
-		n.metrics = initMetrics(registry, detailed)
+		n.metrics = initMetrics(registry, namespace, detailed, n.index)
 		return nil
 	}
 }
@@ -243,8 +268,17 @@ func WithLeaderTimeout(leaderTimeout time.Duration) NodeOption {
 	}
 }
 
+// WithUnaryGRPCTimeout used with MakeNode to specify timeout in gRPC RPC commands. By default, gRPC timeouts are set to
+// 5s.
+func WithUnaryGRPCTimeout(d time.Duration) NodeOption {
+	return func(n *Node) error {
+		n.config.timers.gRPCTimeout = d
+		return nil
+	}
+}
+
 // WithChannelDepthToClientOffload allows the application to overload the channel depth between the raft core engine,
-// and the goroutine which handles messaging to the remote nodes. A sensible default value is used if this option is not
+// and the goroutine which handles messaging to the remote nodes. A sensible default value (32) is used if this option is not
 // specified.
 func WithChannelDepthToClientOffload(depth int32) NodeOption {
 	return func(n *Node) error {
@@ -252,6 +286,18 @@ func WithChannelDepthToClientOffload(depth int32) NodeOption {
 			return errors.New("bad channel depth in WithChannelDepthToClientOffload, must be > 0")
 		}
 		n.config.channelDepth.clientEvents = depth
+		return nil
+	}
+}
+
+// WithLogCommandBatchSize sets the maximum number of log commands which can be sent in one AppendEntryRequest RPC.
+// Defaults to a sensible value (32) if not set.
+func WithLogCommandBatchSize(depth int32) NodeOption {
+	return func(n *Node) error {
+		if depth <= 0 {
+			return errors.New("bad batch size in WithLogCommandBatchSize, must be > 0")
+		}
+		n.config.logCmdBatchSize = depth
 		return nil
 	}
 }
@@ -360,7 +406,7 @@ func MakeNode(
 		return nil, raftErrorf(err, "init logging failed")
 	}
 
-	n.logger.Info("raft package, starting up (logging can be customised or disabled using WithLogger option)")
+	n.logger.Info("raft package, hello (logging can be customised or disabled using WithLogger options)")
 
 	err = initMessaging(ctx, n)
 	if err != nil {
@@ -401,14 +447,14 @@ func MakeNode(
 			n.logger.Info("raft package internal shutdown triggered")
 
 		case <-ctx.Done():
-			n.logger.Info("raft package owner is requesting a shutdown")
+			n.logger.Info("application is requesting a shutdown")
 		}
 
 		fec := n.fatalErrorCount.Load()
 		if fec == 0 {
 			n.blockOnGracefulShutdown()
 		} else {
-			n.logger.Info("raft skipping graceful shutdown because we have taken fatal errors already")
+			n.logger.Debug("raft skipping graceful shutdown because we have taken fatal errors already")
 		}
 
 		// cancel() will signal exit to all the goroutines spawned by raft package. These will in turn mark wait group done
@@ -421,6 +467,7 @@ func MakeNode(
 		engineWg.Wait()
 
 		// flush the logger to make sure we get all the logs
+		n.logger.Info("raft package, goodbye")
 		n.logger.Sync()
 		wg.Done()
 	}()
@@ -476,7 +523,7 @@ func initLogging(n *Node) error {
 
 	// Set logger name. This will end up being concatenated to a any preexisting log name. E.g. if the application
 	// provide its log named 'myapp', then logger field in logs from raft will be 'myapp.raft'.
-	n.logger = n.logger.Named("raft")
+	n.logger = n.logger.Named(fmt.Sprintf("raft.NODE%d", n.index))
 
 	//
 	// Logger set up already - nothing we need too do.

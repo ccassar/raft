@@ -6,6 +6,7 @@ import (
 	"github.com/ccassar/raft/internal/raft_pb"
 	"go.etcd.io/bbolt"
 	"go.uber.org/atomic"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -16,12 +17,15 @@ func TestLogDBBasicOperations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	const testDB = "test/boltdb.mydb"
+
+	os.Remove(testDB)
 	n := &Node{
 		logger:          testLoggerGet().Sugar(),
 		messaging:       &raftMessaging{},
 		fatalErrorCount: atomic.NewInt32(0),
 		config: &NodeConfig{
-			LogDB:   "test/boltdb.mydb",
+			LogDB:   testDB,
 			LogCmds: make(chan []byte)}}
 
 	t.Log("Initialise persistent raft engine")
@@ -35,27 +39,47 @@ func TestLogDBBasicOperations(t *testing.T) {
 		t.Fatal("Test failed to create logDB")
 	}
 
+	term, index, err := re.logGetLastTermAndIndex()
+	if err != nil {
+		t.Errorf("expect to be able to get last term and index even before we are set [%v]", err)
+	}
+	if term != termNotSet {
+		t.Errorf("expect unset term [%v]", term)
+	}
+	if index != indexNotSet {
+		t.Errorf("expect unset index [%v]", index)
+	}
+
 	t.Log("Test adding log entries")
 	var i int64
-	addCount := 1001
-	for i = 1; i < int64(addCount+1); i++ {
+	addCount := int64(1001)
+	for i = 1; i < addCount+1; i++ {
 		le := raft_pb.LogEntry{
 			Sequence: i,
 		}
-		err = re.logEntryAdd(&le)
+		err = re.logAddEntry(&le)
 		if err != nil {
 			t.Error(err)
 		}
 	}
 
+	term, index, err = re.logGetLastTermAndIndex()
+	if err != nil {
+		t.Errorf("expect to be able to get last term and index [%v]", err)
+	}
+	fmt.Println(term, index)
+
 	t.Log("BoltDB Stats:", fmt.Sprintf("%+v", re.logDB.Stats()))
+	if index != addCount {
+		t.Errorf("expect index [%v] got [%v]", addCount, index)
+	}
 
 	countEntries := func() int {
 		start := int64(1)
 		count := 0
-		batchSize := 17
+		batchSize := int32(17)
 		for {
-			res, err := re.logEntriesGet(start, batchSize)
+			res, err := re.logGetEntries(start, batchSize)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -69,7 +93,7 @@ func TestLogDBBasicOperations(t *testing.T) {
 	}
 
 	count := countEntries()
-	if count != addCount {
+	if int64(count) != addCount {
 		t.Errorf("Test added %v entries, and got back %v", addCount, count)
 	}
 
@@ -92,18 +116,18 @@ func TestLogDBBasicOperations(t *testing.T) {
 	}
 
 	t.Log("Test purging just the last entry")
-	err = re.logEntriesPurgeTail(1001)
+	err = re.logPurgeTailEntries(1001)
 	if err != nil {
 		t.Error(err)
 	}
 
 	count = countEntries()
-	if count != addCount-1 {
+	if int64(count) != addCount-1 {
 		t.Errorf("Test added %v entries, removed 1, and got back %v", addCount, count)
 	}
 
 	t.Log("Test purging all entries")
-	err = re.logEntriesPurgeTail(1)
+	err = re.logPurgeTailEntries(1)
 	if err != nil {
 		t.Error(err)
 	}

@@ -1,6 +1,9 @@
 package raft
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // metricHolder holds metrics from the nodes perspective.
 //
@@ -18,10 +21,13 @@ type metricsHolder struct {
 	registry *prometheus.Registry
 	// Are we tracking expensive metrics?
 	detailed bool
+	//
+	// Metrics
+	stateGauge prometheus.Gauge
 }
 
 // Set up a metricsHolder to collect metrics for a given node.
-func initMetrics(registry *prometheus.Registry, detailed bool) *metricsHolder {
+func initMetrics(registry *prometheus.Registry, namespace string, detailed bool, nodeIndex int32) *metricsHolder {
 
 	if registry == nil {
 		var ok bool
@@ -35,6 +41,21 @@ func initMetrics(registry *prometheus.Registry, detailed bool) *metricsHolder {
 		detailed: detailed,
 		registry: registry,
 	}
+
+	// We include a const label to indicate which node index in the cluster is originating the metric. In production
+	// environments the node could typically be inferred from labels added externally as part of the deployment (e.g.
+	// kubernetes prometheus operator jobLabel). Incorporating a label tied to the config provides an unambiguous,
+	// possibly redundant target label in the metrics.
+
+	mh.stateGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   namespace,
+		Subsystem:   "raft",
+		Name:        "role",
+		Help:        "role indicates which state node is in at sampling time: follower, candidate or leader (1,2,3 respectively).",
+		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
+	})
+
+	registry.MustRegister(mh.stateGauge)
 
 	return mh
 }

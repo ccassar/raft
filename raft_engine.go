@@ -2,16 +2,20 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"github.com/ccassar/raft/internal/raft_pb"
+	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
 	"go.uber.org/atomic"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 // NodeState: describes the state of the raft node.
-type nodeState string
+type nodeState int
 
 func (state nodeState) String() string {
 	switch state {
@@ -21,17 +25,23 @@ func (state nodeState) String() string {
 		return "candidate"
 	case leader:
 		return "leader"
+	default:
+		return "uninit"
 	}
-	return "illegal"
+}
+
+func (state nodeState) Code() int {
+	return int(state)
 }
 
 const (
+	uninit nodeState = iota
 	// Node is follower according to Raft spec. This is the initial state of the node coming up.
-	follower nodeState = "follower"
+	follower
 	// Node is candidate according to Raft spec, during election phase.
-	candidate = "candidate"
+	candidate
 	// Node is leader in current CurrentTerm according to Raft spec.
-	leader = "leader"
+	leader
 )
 
 // stateFn variation of state machine; or a variation at least, as described by r@golang.orf here:
@@ -47,8 +57,10 @@ type stateFn func(context.Context) stateFn
 type raftEngine struct {
 	node  *Node
 	state nodeState
-	// Persisted state on all nodes. We embed the protobuf derived structure for ease of serialisation.
-	raft_pb.PersistedState
+	// Persisted state on all nodes. We do not embed the protobuf so as to support atomic in-memory access from
+	// client and raftEngine goroutines.
+	votedFor    atomic.Int32
+	currentTerm atomic.Int64
 	// Persisted log
 	logDB *bolt.DB
 	// Volatile state on all nodes.
@@ -71,8 +83,11 @@ type raftEngine struct {
 	inboundRequestVoteChan    chan *requestVoteContainer
 	inboundLogCommandChan     chan *logCommandContainer
 	inboundRequestTimeoutChan chan *requestTimeoutContainer
+	// The returns channel for AppendEntries is used to signal data arising from client side pertinent to the
+	// raftEngine side - e.g. discovery of new term, indication of newly acknowledged messages which then require
+	// committedIndex updates.
+	returnsAppendEntryResponsesFromClientChan chan *appendEntryResponsesFromClient
 	// The returns channels are used to return results asynchronously from the gRPC client goroutines.
-	returnsAppendEntryChan    chan *appendEntryContainer
 	returnsRequestVoteChan    chan *requestVoteContainer
 	returnsLogCommandChan     chan *logCommandContainer
 	returnsRequestTimeoutChan chan *requestTimeoutContainer
@@ -96,32 +111,90 @@ type raftEngineCandidate struct {
 }
 
 type clientStateAtLeader struct {
-	// TODO initialise to the lastLogIndex + 1
-	nextIndex           int64
-	matchIndex          int64
-	keepaliveDue        *time.Timer
-	lastAppendEntrySent time.Time
+	nextIndex *atomic.Int64
+	// matchIndex is set on the client goroutine as it receives results to AppendEntry requests. matchIndex
+	// is read on the raftEngine side and is used to manage the committedIndex.
+	matchIndex *atomic.Int64
+	// termOfOrigin is immutable; set once at clientStateAtLeader creation time to reflect which term it is
+	// pertinent too. termOfOrigin is accessed both on the client and raftEngine goroutines.
+	termOfOrigin int64
+	// Keepalive time is accessed and updated on the raftEngine thread only.
+	keepaliveDue *time.Timer
+	// lastAppendEntrySent is set and read on the client side to dampen unnecessary keepalives. Also displayed
+	// in logKV, and so we protect it with lock.
+	lastAppendEntrySentMu sync.RWMutex
+	lastAppendEntrySent   time.Time
 }
 
-func (l *raftEngineLeader) validateClientIndex(clientIndex int32) bool {
-	if _, ok := l.clients[clientIndex]; !ok {
+func (cal *clientStateAtLeader) getLastAppendEntrySent() time.Time {
+	cal.lastAppendEntrySentMu.RLock()
+	t := cal.lastAppendEntrySent
+	cal.lastAppendEntrySentMu.RUnlock()
+	return t
+}
+
+func (cal *clientStateAtLeader) setLastAppendEntrySent(t time.Time) {
+	cal.lastAppendEntrySentMu.Lock()
+	cal.lastAppendEntrySent = time.Now()
+	cal.lastAppendEntrySentMu.Unlock()
+}
+
+func (l *raftEngineLeader) mustGetClientAtLeaderFromId(clientIndex int32) *clientStateAtLeader {
+	cal, ok := l.clients[clientIndex]
+	if !ok {
 		err := raftErrorf(RaftErrorOutOfBoundsClient, "failed to validate client is known to leader")
 		l.engine.node.logger.Errorw("client validation failed", append(l.engine.logKV(), raftErrKeyword, err)...)
 		l.engine.node.signalFatalError(err)
-		return false
+		return nil
 	} // else signal shutdown with error
-	return true
+
+	return cal
 }
 
-func (l *raftEngineLeader) resetKeepalive(ctx context.Context, clientIndex int32, d time.Duration) {
+func (l *raftEngineLeader) resetKeepalive(clientIndex int32, d time.Duration) {
 
-	if l.validateClientIndex(clientIndex) {
-		cal := l.clients[clientIndex]
+	cal := l.mustGetClientAtLeaderFromId(clientIndex)
+	if cal != nil {
 		// With AfterFunc, it does not matter if Reset returns true or false. If reset raced with the expiration,
 		// both winning and losing the race is fine - if we lose the race we schedule the keepalive when we could
 		// have avoided it, but then we still block the keepalive on dispatch.
 		cal.keepaliveDue.Reset(d)
 	}
+}
+
+func (l *raftEngineLeader) notifyClientToProduceAppendEntries(ctx context.Context, clientIndex int32) {
+	client := l.engine.node.mustGetClientFromId(clientIndex)
+	cal := l.mustGetClientAtLeaderFromId(clientIndex)
+	if client != nil && cal != nil {
+		client.eventChan.postMessageWithFlush(
+			ctx, &appendEntryEvent{client: client, cal: cal})
+		l.resetKeepalive(client.index, l.engine.node.keepalivePeriod())
+	}
+}
+
+type orderedCandidates []int64
+
+func (a orderedCandidates) Len() int           { return len(a) }
+func (a orderedCandidates) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a orderedCandidates) Less(i, j int) bool { return a[i] < a[j] }
+
+func (l *raftEngineLeader) maintainCommittedIndexForLeader() {
+	oc := make(orderedCandidates, 0, len(l.clients))
+	for i, cal := range l.clients {
+		oc[i] = cal.matchIndex.Load()
+	}
+
+	nodeToCheck := len(l.engine.node.config.Nodes)>>1 - 1
+	sort.Sort(oc)
+
+	// committed index can be no better than the last acknoledged loge entry of the middle - 1 remote node. We know
+	// more than the majority have acknowledged that value.
+	l.engine.updateCommittedIndexIfNecessary(oc[nodeToCheck])
+
+	//
+	// Wake up acker if necessary. Acker will be scheduled to run and validate whether any pending acks need to be
+	// issued to local terminated or remote applications.
+	l.acker.notify()
 }
 
 // raftEngineLeader tracks state pertinent to when a node is in leader state. When node transitions to
@@ -135,18 +208,8 @@ type raftEngineLeader struct {
 
 const noLeader = -1
 const notVotedThisTerm = -1
-const indexNotSet = -1
-
-func (re *raftEngine) logKV() []interface{} {
-	return []interface{}{
-		"localNodeIndex", re.node.index,
-		"currentTerm", re.CurrentTerm,
-		"commitIndex", re.commitIndex.Load(),
-		"appliedIndex", re.lastApplied.Load(),
-		"state", re.state,
-		"VotedFor", re.VotedFor,
-		"currentLeader", re.currentLeader.Load()}
-}
+const indexNotSet = int64(-1)
+const termNotSet = int64(0)
 
 type requestVoteContainer struct {
 	request    *raft_pb.RequestVoteRequest
@@ -169,14 +232,21 @@ type appendEntryContainer struct {
 	returnChan chan *appendEntryContainer
 }
 
+type appendEntryResponsesFromClient struct {
+	request *raft_pb.AppendEntryRequest
+	err     error
+	reply   *raft_pb.AppendEntryReply
+}
+
 type logCommandContainer struct {
 	request    *raft_pb.LogCommandRequest
 	err        error
 	reply      *raft_pb.LogCommandReply
 	returnChan chan *logCommandContainer
+	appCtx     context.Context
 }
 
-func (msg *appendEntryContainer) getIndexRangeForRequest() (int64, int64) {
+func (msg *appendEntryResponsesFromClient) getIndexRangeForRequest() (int64, int64) {
 	firstInRange := int64(indexNotSet)
 	lastInRange := int64(indexNotSet)
 	leCount := len(msg.request.LogEntry)
@@ -195,20 +265,23 @@ func (msg *appendEntryContainer) getIndexRangeForRequest() (int64, int64) {
 
 func initRaftEngine(ctx context.Context, n *Node) error {
 
+	n.logger.Debugw("raftEngine, initialising", n.logKV()...)
+
 	re := &raftEngine{
 		node:                      n,
 		inboundAppendEntryChan:    make(chan *appendEntryContainer, n.config.channelDepth.serverEvents),
 		inboundRequestVoteChan:    make(chan *requestVoteContainer, n.config.channelDepth.serverEvents),
 		inboundLogCommandChan:     make(chan *logCommandContainer, n.config.channelDepth.serverEvents),
 		inboundRequestTimeoutChan: make(chan *requestTimeoutContainer, n.config.channelDepth.serverEvents),
-		returnsAppendEntryChan:    make(chan *appendEntryContainer, n.config.channelDepth.serverEvents),
-		returnsRequestVoteChan:    make(chan *requestVoteContainer, n.config.channelDepth.serverEvents),
-		returnsLogCommandChan:     make(chan *logCommandContainer, n.config.channelDepth.serverEvents),
-		returnsRequestTimeoutChan: make(chan *requestTimeoutContainer, n.config.channelDepth.serverEvents),
-		localLogCommandChan:       make(chan *logCommandContainer, 1),
-		commitIndex:               atomic.NewInt64(0),
-		lastApplied:               atomic.NewInt64(0),
-		currentLeader:             atomic.NewInt32(int32(noLeader)),
+		returnsAppendEntryResponsesFromClientChan: make(chan *appendEntryResponsesFromClient, n.config.channelDepth.serverEvents),
+		returnsRequestVoteChan:                    make(chan *requestVoteContainer, n.config.channelDepth.serverEvents),
+		returnsLogCommandChan:                     make(chan *logCommandContainer, n.config.channelDepth.serverEvents),
+		returnsRequestTimeoutChan:                 make(chan *requestTimeoutContainer, n.config.channelDepth.serverEvents),
+		localLogCommandChan:                       make(chan *logCommandContainer, 1),
+		commitIndex:                               atomic.NewInt64(0),
+		lastApplied:                               atomic.NewInt64(0),
+		currentLeader:                             atomic.NewInt32(int32(noLeader)),
+		state:                                     uninit,
 	}
 
 	n.engine = re
@@ -218,6 +291,28 @@ func initRaftEngine(ctx context.Context, n *Node) error {
 	}
 
 	return nil
+}
+
+func (re *raftEngine) logKV() []interface{} {
+	return []interface{}{
+		"currentTerm", re.currentTerm.Load(),
+		"commitIndex", re.commitIndex.Load(),
+		"appliedIndex", re.lastApplied.Load(),
+		"state", re.state,
+		"VotedFor", re.votedFor.Load(),
+		"currentLeader", re.currentLeader.Load()}
+}
+
+func (re *raftEngine) updateState(state nodeState) {
+	oldState := re.state
+	re.state = state
+
+	if re.node.metrics != nil {
+		re.node.metrics.stateGauge.Set(float64(state.Code()))
+	}
+	re.node.logger.Infow(fmt.Sprintf("ROLE CHANGE: from %s to %s",
+		strings.ToUpper(oldState.String()),
+		strings.ToUpper(state.String())), re.logKV()...)
 }
 
 // raftEngine.run runs the core of the raft algorithm. We have an event loop which handles the state of the raft node,
@@ -239,10 +334,10 @@ func (re *raftEngine) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	for s := re.followerStateFn(ctx); s != nil; {
 		s = s(ctx)
 		n.logger.Debugw(
-			"raftEngine leaving state", re.logKV()...)
+			fmt.Sprintf("ROLE CHANGE: leaving %s", re.state), re.logKV()...)
 	}
 
-	n.logger.Infow("raftEngine, stop LogDB", re.logKV()...)
+	n.logger.Debugw("raftEngine, stop LogDB", re.logKV()...)
 	re.shutdownLogDB()
 
 	n.logger.Infow("raftEngine, stop running", re.logKV()...)
@@ -257,7 +352,7 @@ const (
 )
 
 func (re *raftEngine) updateVotedFor(candidate int32) {
-	re.VotedFor = candidate
+	re.votedFor.Store(candidate)
 	re.saveNodePersistedData()
 }
 
@@ -269,16 +364,18 @@ func (re *raftEngine) updateVotedFor(candidate int32) {
 // If persisted data needs to be updated and for some reason or another fails, we will signal failure
 // and come down.
 func (re *raftEngine) replaceTermIfNewer(rxTerm int64) termComparisonResult {
+
+	currentTerm := re.currentTerm.Load()
 	switch {
-	case rxTerm > re.CurrentTerm:
+	case rxTerm > currentTerm:
 		// update currentTerm and votedFor - this will result in the persistent data being updated.
-		re.CurrentTerm = rxTerm
 		re.updateVotedFor(notVotedThisTerm)
 		re.currentLeader.Store(int32(noLeader))
+		re.currentTerm.Store(rxTerm)
 		re.node.logger.Debugw("raftEngine declaring new CurrentTerm", re.logKV()...)
 
 		return newTerm
-	case rxTerm < re.CurrentTerm:
+	case rxTerm < currentTerm:
 		return staleTerm
 	default:
 		return sameTerm
@@ -294,8 +391,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 		re.candidateState = nil
 	}()
 
-	re.state = candidate
-	re.node.logger.Debugw("raftEngine entering state", re.logKV()...)
+	re.updateState(candidate)
 
 	var ltTimer *time.Timer
 
@@ -311,17 +407,23 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 			votesReceived: map[int32]bool{},
 		}
 
-		lastLogTerm, lastLogIndex, err := re.logEntryGetLastTermAndIndex()
+		lastLogTerm, lastLogIndex, err := re.logGetLastTermAndIndex()
 		if err != nil {
 			return nil // error logged and we will be shut down.
 		}
 
+		// Time to declare a new CurrentTerm...
+		re.replaceTermIfNewer(re.currentTerm.Load() + 1)
+		re.node.logger.Debugw("raftEngine candidate, declared new term", re.logKV()...)
+
+		// ship off request votes to clients... whatever clients were sending out in previous state, given the new CurrentTerm,
+		// can be flushed too. So, what we do here, is turn on flush, post flush-off message, and send our request vote.
 		for _, client := range re.node.messaging.clients {
-			postMessageToClientWithFlush(ctx, client, &requestVoteEvent{
+			client.eventChan.postMessageWithFlush(ctx, &requestVoteEvent{
 				client: client,
 				container: requestVoteContainer{
 					request: &raft_pb.RequestVoteRequest{
-						Term:         re.CurrentTerm,
+						Term:         re.currentTerm.Load(),
 						CandidateId:  re.node.index,
 						LastLogIndex: lastLogIndex,
 						LastLogTerm:  lastLogTerm,
@@ -334,6 +436,10 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 			})
 		}
 
+		// - oh and vote for myself
+		re.candidateState.votesReceived[re.node.index] = true
+		re.updateVotedFor(re.node.index)
+
 		leaderTimeout := randomiseDuration(re.node.config.timers.leaderTimeout)
 		re.node.logger.Debugw("raftEngine candidate, extending leader timeout",
 			append(re.logKV(), "period", leaderTimeout.String())...)
@@ -343,17 +449,6 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 		} else {
 			ltTimer.Reset(leaderTimeout)
 		}
-
-		// Time to declare a new CurrentTerm...
-		re.replaceTermIfNewer(re.CurrentTerm + 1)
-		re.node.logger.Debugw("raftEngine candidate, declared new term", re.logKV()...)
-
-		// ship off request votes to clients... whatever clients were sending out in previous state, given the new CurrentTerm,
-		// can be flushed too. So, what we do here, is turn on flush, post flush-off message, and send our request vote.
-
-		// - oh and vote for myself
-		re.candidateState.votesReceived[re.node.index] = true
-		re.updateVotedFor(re.node.index)
 
 	innerLoop:
 		for {
@@ -397,7 +492,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 						append(re.logKV(), "remoteNodeIndex", msg.request.CandidateId)...)
 				}
 
-			case msg := <-re.returnsAppendEntryChan:
+			case msg := <-re.returnsAppendEntryResponsesFromClientChan:
 				// We should have not be getting AppendEntry replies at this point. We simply discard the replies.
 				re.node.logger.Debugw(
 					"raftEngine candidate, ignoring AppendEntry replies from remote client",
@@ -450,20 +545,19 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 
 func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 
-	re.node.logger.Debugw("raftEngine entering state", "new", leader)
 	re.currentLeader.Store(re.node.index)
-	re.state = leader
+	re.updateState(leader)
 
-	ackerContext, cancel := context.WithCancel(ctx)
+	leaderCtx, cancel := context.WithCancel(ctx)
 	var ackerWg sync.WaitGroup
 
-	defer func() {
+	defer func(wg *sync.WaitGroup, cancel context.CancelFunc) {
 		// Purge leader state on the way out of this state.
 		cancel()
+		re.node.logger.Debug("raftEngine waiting for acker to shutdown on the way down from leader")
 		ackerWg.Wait()
 		re.leaderState = nil
-
-	}()
+	}(&ackerWg, cancel)
 
 	//
 	// First thing we do when we become leaders is set up fresh state. This includes setting up the acker; independent
@@ -472,39 +566,40 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 	// stops the acker, and discards its state.
 	ackerWg.Add(1)
 	re.leaderState = &raftEngineLeader{
-		engine:  re,
-		clients: map[int32]*clientStateAtLeader{},
-		acker:   createLogAcknowledgerAndRun(ackerContext, &ackerWg, re.commitIndex, re.node.logger),
+		engine:             re,
+		clients:            map[int32]*clientStateAtLeader{},
+		clientKeepaliveDue: make(chan int32, re.node.config.channelDepth.serverEvents),
+		acker:              createLogAcknowledgerAndRun(leaderCtx, &ackerWg, re.commitIndex, re.node.logger),
 	}
 
-	// Setup per-client keepalive timers.
+	_, ourLastIndex, err := re.logGetLastTermAndIndex()
+	if err != nil { // logged and triggered shutdown in called function on catastrophic failure.
+		return nil
+	}
+
+	// Setup per-client state (e.g. keepalive ticker, indices etc.)
 	// Shutdown keepalive timers when we leave this state since we will no longer want to be sending
 	// keepalives when we leave leader state.
-	keepalivePeriod := re.node.keepalivePeriod()
-	timerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	for i, cal := range re.leaderState.clients {
+
+	for i := int32(0); i < int32(len(re.node.config.Nodes)); i++ {
+
+		cal := &clientStateAtLeader{
+			termOfOrigin: re.currentTerm.Load(),
+			nextIndex:    atomic.NewInt64(ourLastIndex + 1),
+			matchIndex:   atomic.NewInt64(0),
+		}
+
 		// Initial expiration is quasi-instant. We want to send a Keepalive right away when we expire.
-		cal.keepaliveDue = time.AfterFunc(time.Microsecond, func() {
-			select {
-			case <-timerCtx.Done():
-				return
-			case re.leaderState.clientKeepaliveDue <- i:
-			default:
-				// if keepaliveDue channel is full, we can safely skip scheduling the keepalive. It means we
-				// have not picked up enough messages, that we will be bumped from leader anyway.
-			}
-			re.leaderState.resetKeepalive(ctx, i, keepalivePeriod)
-		})
+		// Of course the function will be periodically rescheduled.
+		cal.keepaliveDue = time.AfterFunc(
+			time.Nanosecond,
+			keepaliveGenerator(leaderCtx, i, re.leaderState.clientKeepaliveDue))
+
+		re.leaderState.clients[i] = cal
 	}
 
 	for {
 		select {
-
-		case clientIndex := <-re.leaderState.clientKeepaliveDue:
-			re.node.logger.Debugw("raftEngine leader, send keepalive",
-				append(re.logKV(), "remoteNodeIndex", clientIndex)...)
-			re.produceAppendEntry(ctx, clientIndex, []*raft_pb.LogEntry{})
 
 		case msg := <-re.inboundAppendEntryChan:
 			outcome := re.handleRxedAppendEntry(msg, false)
@@ -536,65 +631,63 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 					append(re.logKV(), "remoteNodeIndex", msg.request.CandidateId)...)
 			}
 
-		case msg := <-re.returnsAppendEntryChan:
+		case msg := <-re.inboundLogCommandChan:
+			re.handleLogCommandContainer(ctx, msg)
 
+		case msg := <-re.localLogCommandChan:
+			re.handleLogCommandContainer(ctx, msg)
+
+		case clientIndex := <-re.leaderState.clientKeepaliveDue:
+
+			client, ok := re.node.messaging.clients[clientIndex]
+			if ok {
+				re.node.logger.Debugw("raftEngine leader, send keepalive",
+					append(re.logKV(), "remoteNodeIndex", clientIndex)...)
+				client.eventChan.postMessageWithFlush(
+					ctx, &appendEntryEvent{client: client, cal: re.leaderState.clients[clientIndex]})
+			}
+			re.leaderState.resetKeepalive(clientIndex, re.node.keepalivePeriod())
+
+		case msg := <-re.returnsAppendEntryResponsesFromClientChan:
+
+			// Why are we here? The client go routine handles sending the AppendEntry requests to
+			// the client. It does forward up results when a) they result in update to matchIndex which
+			// should cause us to reevaluate our committedIndex, b) on failure if retry is required...
+			// going through the raft engine ensures retries are only rescheduled while we remain
+			// leaders c) in the case it gets terms back which do not match our current term.
+			//
+			// TODO We need to introduce exponential backoff here.
 			if msg.err != nil {
-				re.node.logger.Debugw(
-					"raftEngine leader, AppendEntry reply from remote client with error",
-					append(re.logKV(), "remoteNodeIndex", msg.request.To, raftErrKeyword, msg.err)...)
+				switch errors.Cause(msg.err) {
+				case raftErrorMismatchedTerm:
+
+					switch re.replaceTermIfNewer(msg.reply.Term) {
+					case staleTerm:
+						re.node.logger.Debugw(
+							"raftEngine leader, ignoring AppendEntry reply from stale remote client, will retry",
+							append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
+						re.leaderState.notifyClientToProduceAppendEntries(ctx, msg.request.To)
+						continue
+
+					case newTerm:
+						re.node.logger.Debugw(
+							"raftEngine leader, received AppendEntry reply from client in a future term",
+							append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
+						return re.followerStateFn
+					}
+
+				default:
+					re.node.logger.Debugw(
+						"raftEngine leader, error AppendEntry reply for remote client, will retry",
+						append(re.logKV(), "remoteNodeIndex", msg.request.To, raftErrKeyword, msg.err)...)
+					re.leaderState.notifyClientToProduceAppendEntries(ctx, msg.request.To)
+				}
 				continue
 			}
 
-			switch re.replaceTermIfNewer(msg.request.Term) {
-			case staleTerm:
-				re.node.logger.Debugw(
-					"raftEngine leader, ignoring AppendEntry reply from stale remote client",
-					append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
-
-			case sameTerm:
-
-				firstInRange, lastInRange := msg.getIndexRangeForRequest()
-
-				//
-				// Exciting times. We are receiving response for AppendRequest. Result could be that we have
-				// in fact committed whatever was in the log, or trigger the need to retry.
-				if msg.err == nil {
-
-					if re.leaderState.validateClientIndex(msg.request.To) {
-
-						cal := re.leaderState.clients[msg.request.To]
-
-						if msg.reply.Ack {
-							if lastInRange != indexNotSet {
-								cal.matchIndex = lastInRange
-							}
-							re.node.logger.Debugw(
-								"raftEngine leader, received AppendEntry reply from client, ack",
-								append(re.logKV(), "remoteNodeIndex", msg.request.To,
-									"indexFirst", firstInRange, "indexLast", lastInRange)...)
-
-						} else {
-							// Do not update matchIndex, and this will be accounted for in the send next.
-							re.node.logger.Debugw(
-								"raftEngine leader, received AppendEntry reply from client, nak",
-								append(re.logKV(), "remoteNodeIndex", msg.request.To,
-									"indexFirst", firstInRange, "indexLast", lastInRange)...)
-						}
-					}
-
-				} else {
-					re.node.logger.Debugw(
-						"raftEngine leader, received AppendEntry reply from client with error",
-						append(re.logKV(), "remoteNodeIndex", msg.request.To,
-							"indexFirst", firstInRange, "indexLast", lastInRange, raftErrKeyword, msg.err)...)
-				}
-
-			case newTerm:
-				re.node.logger.Debugw(
-					"raftEngine leader, received AppendEntry reply from client in a future term",
-					append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
-				return re.followerStateFn
-			}
+			// The only other reason we are poked is if we need to reevaluate our committedIndex (and consequently issue
+			// local or remote acks to application on the basis that client's matchIndex has been updated.)
+			re.leaderState.maintainCommittedIndexForLeader()
 
 		case msg := <-re.returnsRequestVoteChan:
 
@@ -631,11 +724,65 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 	}
 }
 
+// keepaliveGenerator is used as AfterFunc to schedule a keepalive for a given node.
+func keepaliveGenerator(ctx context.Context, index int32, trigger chan int32) func() {
+	return func() {
+		select {
+		case trigger <- index:
+		case <-ctx.Done():
+			// All timers are cancelled when leader state function exists.
+		}
+	}
+}
+
+// rafteEngine.handleLogCommandContainer is expected to only be called when we are leader.
+func (re *raftEngine) handleLogCommandContainer(ctx context.Context, msg *logCommandContainer) {
+
+	failed := func(msg *logCommandContainer, why string, err error) {
+		re.node.logger.Debugw(
+			"raftEngine leader, error handling log command from application",
+			append(re.logKV(), "remoteNodeIndex", msg.request.Origin)...)
+		msg.reply = &raft_pb.LogCommandReply{
+			Ack:    false,
+			Reason: why}
+		msg.returnChan <- msg // dedicated response channel will not block.
+	}
+
+	// We have received a new inbound command. We need to start by appending it to the log.
+	// Then we need to notify the gRPC clients for the remote nodes. The event passed is what
+	// effectively pulls up the AppendEntries required and pushes.
+	_, index, err := re.logGetLastTermAndIndex()
+	if err != nil {
+		failed(msg, "leader failed fetching index from persisted log, "+
+			"leader resigning, please retry", err)
+		return
+	}
+	index++
+	// Now that we have an index, and know our current term, let's add it to the log.
+	err = re.logAddEntry(&raft_pb.LogEntry{
+		Term:     re.currentTerm.Load(),
+		Sequence: index,
+		Data:     msg.request.Command})
+	if err != nil {
+		failed(msg, "leader failure adding persisted log, "+
+			"leader resigning, please retry", err)
+		return
+	}
+
+	// Next we need to track the pending ack with the acker. When the index gets committed, the ack
+	// will be dispatched.
+	re.leaderState.acker.trackPendingAck(msg, index)
+	// We need to potentially notify each client that they may need to wake up to resync.
+	// To do that we send the notify event which embodies the pulling and syncing necessary.
+	for _, client := range re.node.messaging.clients {
+		re.leaderState.notifyClientToProduceAppendEntries(ctx, client.index)
+	}
+}
+
 // followerStateFn describes the behaviour of the node while in follower state.
 func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 
-	re.node.logger.Debugw("raftEngine entering state", "new", follower)
-	re.state = follower
+	re.updateState(follower)
 
 	// While in follower state the following can happen...
 	// - rx append entries from leader
@@ -699,7 +846,7 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 						append(re.logKV(), "remoteNodeIndex", msg.request.CandidateId)...)
 				}
 
-			case msg := <-re.returnsAppendEntryChan:
+			case msg := <-re.returnsAppendEntryResponsesFromClientChan:
 				re.node.logger.Debugw(
 					"raftEngine follower, ignoring AppendEntry replies from remote client",
 					append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
@@ -708,6 +855,33 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 				re.node.logger.Debugw(
 					"raftEngine follower, ignoring RequestVote replies from remote client",
 					append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
+
+			case msg := <-re.localLogCommandChan:
+
+				leader := re.currentLeader.Load()
+				var pushed bool
+				if leader < int32(len(re.node.messaging.clients)) && leader >= 0 {
+					client := re.node.messaging.clients[leader]
+					logCmdEv := &logCmdEvent{client: client, container: msg}
+					pushed = client.eventChan.postMessage(ctx, logCmdEv)
+					if !pushed {
+						msg.err = raftErrorf(
+							RaftErrorLogCommandLocalDrop, "back pressure from gRPC client [%d]", leader)
+						re.node.logger.Debugw(
+							"raftEngine candidate, skipped sending logCmd to remote leader, backpressure",
+							append(re.logKV(), logCmdEv.logKV()...)...)
+					}
+				} else {
+					msg.err = raftErrorf(
+						RaftErrorLogCommandLocalDrop, "no gRPC client for leader [%d]", leader)
+					re.node.logger.Debugw(
+						"raftEngine candidate, skipped sending logCmd to remote leader",
+						append(re.logKV(), "leader", leader)...)
+				}
+
+				if !pushed {
+					msg.returnChan <- msg
+				}
 
 			case <-ctx.Done():
 				ltTimerStop()
@@ -731,16 +905,24 @@ func (re *raftEngine) handleRxedRequestVote(msg *requestVoteContainer) bool {
 
 	case sameTerm, newTerm:
 
-		// TODO check msg.request.LastLogIndex and make sure it is at or later than this node's.
-		if re.VotedFor == notVotedThisTerm {
+		_, ourLastIndex, err := re.logGetLastTermAndIndex()
+		if err == nil {
+			if msg.request.LastLogIndex >= ourLastIndex {
 
-			re.updateVotedFor(msg.request.CandidateId)
-			grant = true
-		}
+				if re.votedFor.Load() == msg.request.CandidateId {
+					// we have already granted this candidate our vote in this term. We regrant it.
+					grant = true
+				}
+				if re.votedFor.Load() == notVotedThisTerm {
+					re.updateVotedFor(msg.request.CandidateId)
+					grant = true
+				}
+			}
+		} // else we have logged error in called function already.
 	}
 
 	msg.reply = &raft_pb.RequestVoteReply{
-		Term:        re.CurrentTerm,
+		Term:        re.currentTerm.Load(),
 		VoterId:     re.node.index,
 		VoteGranted: grant,
 	}
@@ -778,28 +960,32 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 		if okInTerm || checkTerm == newTerm {
 
 			// Check we have all previous entries (prevLogIndex is in our log with the right term); accept if so,
-			// reject otherwise.
-			le, err := re.logEntryGet(msg.request.PrevLogIndex)
+			// reject otherwise. Note we do this even if no log entries are included. This is important because
+			// rejecting the keepalive is how we sync up the client to the leader if there is a mismatch (consider the
+			// case where no new log entries are added after a new election - only the keepalive is available for
+			// follower to force log sync up with leader).
+			firstEntry := msg.request.PrevLogIndex == 0 && msg.request.PrevLogTerm == 0
+			le, err := re.logGetEntry(msg.request.PrevLogIndex)
 			if err == nil {
-				if le != nil {
-					if le.Term == msg.request.PrevLogTerm {
+				if firstEntry || le != nil {
+					if firstEntry || le.Term == msg.request.PrevLogTerm {
 						//
 						// Looks like we're in business. We need to handle the fact that we may have some new entries
 						// to add (and possibly some to clear). Append all new entries, and purge any remaining ones if
-						// we encounter a term/sequence discrepancy (as per Figure 2, Step 3 in ISUCA).
+						// AND ONLY IF we encounter a term/sequence discrepancy (as per Figure 2, Step 3 in ISUCA).
 						outcome = accepted
 						ack = true
 
 						for _, newLe := range msg.request.LogEntry {
 							var existingLe *raft_pb.LogEntry
-							existingLe, err = re.logEntryGet(newLe.Sequence)
+							existingLe, err = re.logGetEntry(newLe.Sequence)
 							if err == nil {
 								if existingLe == nil {
-									err = re.logEntryAdd(newLe)
+									err = re.logAddEntry(newLe)
 								} else if existingLe.Term != newLe.Term {
-									err = re.logEntriesPurgeTail(existingLe.Sequence)
+									err = re.logPurgeTailEntries(existingLe.Sequence)
 									if err == nil {
-										err = re.logEntryAdd(newLe)
+										err = re.logAddEntry(newLe)
 									}
 								}
 							}
@@ -812,14 +998,11 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 					} else {
 						re.node.logger.Debugw("AppendEntry rejected update, previous term mismatch", re.logKV()...)
 					}
-				} else {
+				} else if !firstEntry {
 					re.node.logger.Debugw("AppendEntry rejected update, previous index missing", re.logKV()...)
 				}
 			}
 
-			if err != nil {
-				re.node.signalFatalError(err)
-			}
 		}
 
 		if err == nil && ack == true {
@@ -827,22 +1010,13 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 			if latestSequenceAdded < msg.request.CommittedIndex {
 				newCommittedAndLearned = latestSequenceAdded
 			}
-			if re.commitIndex.Load() < newCommittedAndLearned {
-				// Updates only happen on this goroutine, so it is ok to simply store the new value.
-				// We do need to notify the publisher that new commits are available assuming prior notification
-				// is not still pending. Publisher will only check commitIndex it needs to get to after it drains
-				// the notification, so no updates will ever be missed. Worst case is that sometimes, publisher
-				// may get a notification and it is already up to date which is fine.
-				re.commitIndex.Store(newCommittedAndLearned)
-				re.node.logger.Debugw("AppendEntry handler updated commitIndex", re.logKV()...)
-				re.publisher.notify()
-			}
+			re.updateCommittedIndexIfNecessary(newCommittedAndLearned)
 		}
 
 	}
 
 	msg.reply = &raft_pb.AppendEntryReply{
-		Term: re.CurrentTerm,
+		Term: re.currentTerm.Load(),
 		Ack:  ack,
 	}
 	msg.err = err
@@ -851,35 +1025,17 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 	return outcome
 }
 
-func (re *raftEngine) produceAppendEntry(ctx context.Context, clientIndex int32, le []*raft_pb.LogEntry) {
-
-	if re.leaderState.validateClientIndex(clientIndex) {
-
-		cal := re.leaderState.clients[clientIndex]
-		if len(le) == 0 {
-			// We're sending a keepalive. If we have sent an entry in the last keepalive period we can avoid sending
-			// it now.
-			if time.Since(cal.lastAppendEntrySent) < re.node.keepalivePeriod() {
-				return
-			}
-		}
-
-		client := re.node.messaging.clients[clientIndex]
-
-		postMessageToClient(ctx, client, &appendEntryEvent{
-			client: client,
-			container: appendEntryContainer{
-				request: &raft_pb.AppendEntryRequest{
-					Term:     re.CurrentTerm,
-					LeaderId: re.node.index,
-					To:       clientIndex,
-					// Todo - log entries
-				},
-				returnChan: re.inboundAppendEntryChan,
-			},
-		})
-
-	} // else signal shutdown with error.
+func (re *raftEngine) updateCommittedIndexIfNecessary(c int64) {
+	if re.commitIndex.Load() < c {
+		// Updates only happen on the raftEngine goroutine, so it is ok to simply store the new value.
+		// We do need to notify the publisher that new commits are available assuming prior notification
+		// is not still pending. Publisher will only check commitIndex it needs to get to after it drains
+		// the notification, so no updates will never be missed. Worst case is that sometimes, publisher
+		// may get a notification and it is already up to date which is fine.
+		re.node.logger.Debugw("raftEngine updating commitIndex", re.logKV()...)
+		re.commitIndex.Store(c)
+		re.publisher.notify()
+	}
 }
 
 // countVote accumulates vote for voter along with the rest, and returns true if we have a majority.
