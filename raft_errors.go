@@ -42,10 +42,19 @@ func (e Error) Error() string { return string(e) }
 // and test against sentinel.
 const RaftErrorBadMakeNodeOption = Error(raftSentinel + "bad MakeNode option")
 
+// RaftErrorBadLocalNodeIndex is returned (extracted using errors.Cause(err)) if localNodeIndex
+// provided is incorrect - typically out-of-bounds of Nodes in cluster. See ExampleMakeNode for an
+// example of how to extract and test against sentinel.
+const RaftErrorBadLocalNodeIndex = Error(raftSentinel + "bad localNodeIndex option")
+
 // RaftErrorServerNotSetup is the sentinel returned  (extracted using errors.Cause(err)) if
 // local address (server side) is not set up when expected. See ExampleMakeNode for an example of how to
 // extract and test against sentinel.
 const RaftErrorServerNotSetup = Error(raftSentinel + "local server side not set up yet")
+
+// RaftErrorLockedBoltDB is the sentinel returned  (extracted using errors.Cause(err)) if
+// boltDB is locked by other process at startup.
+const RaftErrorLockedBoltDB = Error(raftSentinel + "local server side not set up yet")
 
 // RaftErrorClientConnectionUnrecoverable is the sentinel returned  (extracted using errors.Cause(err)) if
 // client gRPC connection to remote node failed. See ExampleMakeNode for an example of how to extract and test against
@@ -58,10 +67,40 @@ const RaftErrorClientConnectionUnrecoverable = Error(
 // and test against sentinel.
 const RaftErrorMissingLogger = Error(raftSentinel + "no logger setup")
 
-// RaftErrorMissingNodeConfig is returned (extracted using errors.Cause(err)) if config options
+// RaftErrorMissingNodeConfig is returned (extracted using errors.Cause(err)) if NodeConfig options
 // provided at start are expected but missing. See ExampleMakeNode for an example of how to extract
 // and test against sentinel.
 const RaftErrorMissingNodeConfig = Error(raftSentinel + "node config insufficient")
+
+// RaftErrorLeaderTransitionInTerm is returned (extracted using errors.Cause(err)) if a transition in leader
+// happens without a change in term. This is a catastrophic unexpected error and would cause a shutdown
+// of raft package if it occurred.
+const RaftErrorLeaderTransitionInTerm = Error(raftSentinel + "mid term leader transition")
+
+// RaftErrorOutOfBoundsClient is returned (extracted using errors.Cause(err)) if logic produces a client
+// index for a client which does not exists. See ExampleMakeNode for an example of how to extract
+// and test against sentinel.
+const RaftErrorOutOfBoundsClient = Error(raftSentinel + "node index outside bounds of known clients")
+
+// RaftErrorNodePersistentData is returned (extracted using errors.Cause(err)) if we fail a bolt operation on the
+// persistent node data in BoltDB. See ExampleMakeNode for an example of how to extract and test against sentinel.
+const RaftErrorNodePersistentData = Error(raftSentinel + "node persistent data failed")
+
+// RaftErrorLogCommandRejected is returned (extracted using errors.Cause(err)) if we fail to commit a log command
+// requested by the application. See ExampleMakeNode for an example of how to extract and test against sentinel.
+const RaftErrorLogCommandRejected = Error(raftSentinel + "log command failed to commit")
+
+// RaftErrorLogCommandLocalDrop is returned (extracted using errors.Cause(err)) if the local raft package drops
+// the log command before we even try to push it to the cluster leader.
+const RaftErrorLogCommandLocalDrop = Error(raftSentinel + "log command dropped locally, please retry")
+
+// RaftErrorMustFailed is returned (extracted using errors.Cause(err)) if the local raft package hits an assertion
+// failure. This will cause the raft package to signal a catastrophic failure and shut itself down
+const RaftErrorMustFailed = Error(raftSentinel + "raft internal assertion, shutting down local node")
+
+// raftErrorMismatchedTerm is returned (extract using errors.Cause(err)) within the raft package, and is used
+// to signal that a mismatched term has been detected in message from remote node.
+const raftErrorMismatchedTerm = Error(raftSentinel + "mismatched term")
 
 // raftErrorf is a simple wrapper which ensures that all raft errors are prefixed
 // consistently, and that we always either wrap a root cause error bubbling up from

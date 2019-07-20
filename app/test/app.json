@@ -1,0 +1,11 @@
+{
+  "Nodes": ["localhost:9091","localhost:9092","localhost:9093"],
+  "LogDB": "/tmp/testlogdb",
+  "LeaderTimeout": "500ms",
+  "LogCmdPeriod": "10s",
+  "Metrics" : {
+    "Hostname": "localhost:9000",
+    "Namespace": "myapp",
+    "Path":"/metrics"
+  }
+}

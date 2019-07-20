@@ -5,7 +5,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"github.com/ccassar/raft/raft_pb"
+	"github.com/ccassar/raft/internal/raft_pb"
+	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -13,16 +14,20 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	status2 "google.golang.org/grpc/status"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+const testMetricsBasePort = 9001
+const testMetricNamespace = "raftTest"
 
 func TestMakeNode(t *testing.T) {
 
@@ -32,23 +37,20 @@ func TestMakeNode(t *testing.T) {
 	// for Nodes can be passed in to all nodes; e.g. these three local instances fired up will between them settle
 	// in the role of one of the configured nodes.
 	nodeCfgs := []NodeConfig{{
-		Nodes: []string{":8088", ":8089", ":8090"},
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}}, {
-		Nodes: []string{":8088", ":8089", ":8090"},
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}}, {
-		Nodes: []string{":8088", ":8089", ":8090"},
-		ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-			return []grpc.DialOption{grpc.WithInsecure()}
-		}},
+		Nodes:   []string{":8088", ":8089", ":8090"},
+		LogDB:   "test/boltdb.8088",
+		LogCmds: make(chan []byte)}, {
+		Nodes:   []string{":8088", ":8089", ":8090"},
+		LogDB:   "test/boltdb.8089",
+		LogCmds: make(chan []byte)}, {
+		Nodes:   []string{":8088", ":8089", ":8090"},
+		LogDB:   "test/boltdb.8090",
+		LogCmds: make(chan []byte)},
 	}
 
 	// Setup prometheus endpoint on default registry.
 	http.Handle("/metrics", promhttp.Handler())
-	promEndpoint := ":8000"
+	promEndpoint := ":8002"
 	go http.ListenAndServe(promEndpoint, nil)
 
 	testCases := []struct {
@@ -61,19 +63,26 @@ func TestMakeNode(t *testing.T) {
 		{
 			"NEGATIVE Cluster of two",
 			[]NodeConfig{{
-				Nodes: []string{":8088", ":8089"},
-				ClientDialOptionsFn: func(l, r string) []grpc.DialOption {
-					return []grpc.DialOption{grpc.WithInsecure()}
-				}}},
+				Nodes:   []string{":8088", ":8089"},
+				LogCmds: make(chan []byte)}},
 			[]NodeOption{},
 			false,
 			func(ctx context.Context, nodes []*Node) error { return nil },
 		},
 		{
-			"NEGATIVE Node Config Missing Explicit Security Option",
+			"NEGATIVE Node Config Missing LogDB",
 			[]NodeConfig{{
-				Nodes:               []string{":8088", ":8089", ":8090"},
-				ClientDialOptionsFn: nil}},
+				Nodes:   []string{":8088", ":8089", ":8090"},
+				LogCmds: make(chan []byte)}},
+			[]NodeOption{},
+			false,
+			func(ctx context.Context, nodes []*Node) error { return nil },
+		},
+		{
+			"NEGATIVE Node Config Missing LogCmds channel",
+			[]NodeConfig{{
+				Nodes: []string{":8088", ":8089", ":8090"},
+				LogDB: "mydb"}},
 			[]NodeOption{},
 			false,
 			func(ctx context.Context, nodes []*Node) error { return nil },
@@ -93,6 +102,12 @@ func TestMakeNode(t *testing.T) {
 			func(ctx context.Context, nodes []*Node) error {
 				// Make sure we do not block event if channel is not drained.
 				for i := 0; i < 3; i++ {
+
+					// force signal failure with bad updates to current leader
+					nodes[0].engine.updateCurrentLeader(-1)
+					nodes[0].engine.updateCurrentLeader(2)
+					nodes[0].engine.updateCurrentLeader(1)
+					// Exercise the dampening showing we have taken fatal error already
 					nodes[0].signalFatalError(fmt.Errorf("testing signal fatal error %d", i))
 				}
 				errChan := nodes[0].FatalErrorChannel()
@@ -108,9 +123,9 @@ func TestMakeNode(t *testing.T) {
 		{
 			"Exercise WithMetrics option(default registry)",
 			nodeCfgs,
-			[]NodeOption{WithMetrics(nil, true)},
+			[]NodeOption{WithMetrics(nil, "", true)},
 			true,
-			evalForClientTimeout,
+			evalForApplicationLoopback,
 		},
 	}
 
@@ -125,8 +140,8 @@ func TestMakeNode(t *testing.T) {
 
 			for i := range tc.cfg {
 				wg.Add(1)
-				n, err := MakeNode(ctx, &wg, tc.cfg[i],
-					append(tc.opts, WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false))...)
+				n, err := MakeNode(ctx, &wg, tc.cfg[i], int32(i),
+					append(tc.opts, WithLogger(l, false))...)
 				if (err == nil) != tc.ok {
 					t.Fatalf("%s, expected [%t], got [%v]", tc.name, tc.ok, err)
 				}
@@ -140,7 +155,7 @@ func TestMakeNode(t *testing.T) {
 
 			if tc.ok { // no point scraping metrics if we do not expect MakeNode to succeed.
 				t.Log("Metrics from all node")
-				t.Log(testScrapeMetrics("http://:8000/metrics"))
+				t.Log(testScrapeMetrics(1, "/metrics"))
 			}
 
 			cancel()
@@ -181,9 +196,12 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		":8082": "server2",
 	}
 
-	nc := NewNodeConfig()
-	nc.Nodes = []string{":8080", ":8081", ":8082"}
-	nc.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+	nc := NodeConfig{
+		Nodes:   []string{":8080", ":8081", ":8082"},
+		LogCmds: make(chan []byte),
+	}
+
+	clientDialOptionsFn := func(local, remote string) []grpc.DialOption {
 		tlsCfg := &tls.Config{
 			ServerName:   serverToName[remote],                   // server name,
 			Certificates: []tls.Certificate{serverToCert[local]}, // client cert
@@ -191,7 +209,7 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		}
 		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
 	}
-	nc.ServerOptionsFn = func(local string) []grpc.ServerOption {
+	serverOptionsFn := func(local string) []grpc.ServerOption {
 		tlsCfg := &tls.Config{
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			Certificates: []tls.Certificate{serverToCert[local]},
@@ -209,12 +227,15 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 	metricsServer := make([]*http.Server, len(nc.Nodes))
 
 	for i := 0; i < len(nc.Nodes); i++ {
-		metricsReg[i], metricsServer[i] = testSetupMetricsRegistryAndServer(
-			fmt.Sprintf(":%d", 8001+i), "/metrics")
+		metricsReg[i], metricsServer[i] = testSetupMetricsRegistryAndServer(int32(i), "/metrics")
+
+		nc.LogDB = fmt.Sprintf("test/boltdb.%d", i)
 		wg.Add(1)
-		n, err := MakeNode(ctx, &wg, nc,
+		n, err := MakeNode(ctx, &wg, nc, int32(i),
+			WithClientDialOptionsFn(clientDialOptionsFn),
+			WithServerOptionsFn(serverOptionsFn),
 			WithLogger(l.Named(fmt.Sprintf("LOG%d", i)), false),
-			WithMetrics(metricsReg[i], true))
+			WithMetrics(metricsReg[i], "", true))
 
 		if err != nil {
 			t.Fatalf("%s, expected ok, got [%v]", t.Name(), err)
@@ -222,14 +243,14 @@ func TestMakeNode_withTLSMutualProtection(t *testing.T) {
 		nodes = append(nodes, n)
 	}
 
-	err = evalForClientTimeout(ctx, nodes)
+	err = evalForApplicationLoopback(ctx, nodes)
 	if err != nil {
 		t.Error(err)
 	}
 
 	for i := 0; i < len(nc.Nodes); i++ {
 		t.Log("Metrics from node: ", nodes[i].logKV())
-		t.Log(testScrapeMetrics(fmt.Sprintf("http://:%d/metrics", 8001+i)))
+		t.Log(testScrapeMetrics(int32(i), "/metrics"))
 		metricsServer[i].Shutdown(ctx)
 	}
 
@@ -279,19 +300,16 @@ func TestInitLogging(t *testing.T) {
 
 func TestInitMessaging(t *testing.T) {
 
-	l, err := DefaultZapLoggerConfig().Build()
-	if err != nil {
-		t.Error("failed to set up logging for test. ", err)
-	}
-
 	n := &Node{
-		logger: l.Sugar(),
+		index:           1,
+		logger:          testLoggerGet().Sugar(),
+		fatalErrorCount: atomic.NewInt32(0),
 		config: &NodeConfig{Nodes: []string{
-			"1.2.3.4:12345", // we expect this to not be picked because it is not local
-			":8989",         // we expect this to be picked because it is local
+			"1.2.3.4:12345",
+			":8989", // we expect this to be picked based on index.
 		}}}
 
-	err = initClients(nil, n)
+	err := initClients(nil, n)
 	if err == nil {
 		t.Errorf("expected initClient on %s nodes to fail", n.config.Nodes[0])
 	} else if errors.Cause(err) != RaftErrorServerNotSetup {
@@ -299,7 +317,7 @@ func TestInitMessaging(t *testing.T) {
 			n.config.Nodes[0], RaftErrorServerNotSetup, err)
 	}
 
-	n.messaging = &raftMessaging{grpcLogging: false}
+	n.messaging = &raftMessaging{}
 	err = initMessaging(nil, n)
 	if err != nil {
 		t.Errorf("expected socket on %s to open, but failed [%v]",
@@ -325,6 +343,191 @@ func TestWrapperErrorRendering(t *testing.T) {
 	fmt.Printf("detail rendering: %+v\n", err)
 }
 
+type testNode struct {
+	nc     NodeConfig
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	node   *Node
+}
+
+func testAddNode(nodes []string, i int, electionPeriod time.Duration) (*testNode, error) {
+	return testAddNodeWithDB(nodes, i, "", electionPeriod)
+}
+
+func testAddNodeWithDB(nodes []string, i int, db string, electionPeriod time.Duration) (*testNode, error) {
+
+	var err error
+
+	var tn testNode
+
+	l := testLoggerGet()
+
+	if db == "" {
+		db = fmt.Sprintf("test/boltdb.%d", i)
+	}
+
+	tn.nc = NodeConfig{
+		Nodes:   nodes,
+		LogDB:   db,
+		LogCmds: make(chan []byte),
+	}
+
+	tn.ctx, tn.cancel = context.WithCancel(context.Background())
+
+	registry, metricsServer := testSetupMetricsRegistryAndServer(int32(i), "/metrics")
+	go func() {
+		<-tn.ctx.Done()
+		metricsServer.Shutdown(context.Background())
+	}()
+
+	tn.wg.Add(1)
+	tn.node, err = MakeNode(tn.ctx, &tn.wg, tn.nc, int32(i),
+		WithLogger(l, false),
+		WithLeaderTimeout(electionPeriod),
+		WithUnaryGRPCTimeout(electionPeriod>>1), // default
+		WithLogCommandBatchSize(48),
+		WithChannelDepthToClientOffload(64),
+		WithMetrics(registry, testMetricNamespace, false))
+
+	return &tn, err
+}
+
+func TestDetectBlockedBoltDB(t *testing.T) {
+	var err error
+	n := make([]*testNode, 2)
+
+	nodes := []string{":8188", ":8189", ":8190"}
+	n[0], err = testAddNodeWithDB(nodes, 0, "test/boltdb.0", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n[1], err = testAddNodeWithDB(nodes, 1, "test/boltdb.0", time.Second)
+	if err == nil {
+		t.Fatal("expected reused bbolt DB to force an error")
+	}
+
+	if errors.Cause(err) != RaftErrorLockedBoltDB {
+		t.Fatal("expected reused bbolt DB to force an error, but error returned is not expected one", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if n[i] != nil && n[i].cancel != nil {
+			n[i].cancel()
+			n[i].wg.Wait()
+		}
+	}
+}
+
+func TestElection(t *testing.T) {
+
+	electionPeriod := time.Millisecond * 400
+	wait := electionPeriod * 30
+	cycles := 5
+	nodeCount := 3
+	for i := 0; i < nodeCount; i++ {
+		os.Remove(fmt.Sprintf("test/boltdb.%d", i))
+	}
+
+	n := make([]*testNode, nodeCount)
+	nodes := []string{":8088", ":8089", ":8090"}
+	var err error
+
+	for cycle := 0; cycle < cycles; cycle++ {
+
+		// Bring up the first node.
+		fmt.Println(" ***************  CYCLE START: Bring up 0")
+		n[0], err = testAddNode(nodes, 0, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fmt.Println(" ***************  Bring up 1")
+		n[1], err = testAddNode(nodes, 1, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		whoIsLeader := testFindNewLeader(n, wait, true)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		//
+		// Bring up new node...
+		fmt.Println(" ***************  Bring up 2")
+		n[2], err = testAddNode(nodes, 2, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		whoIsLeader = testFindNewLeader(n, wait, false)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		fmt.Println(" ***************  Kill the current leader", whoIsLeader)
+		n[whoIsLeader].cancel()
+		n[whoIsLeader].cancel = nil
+		n[whoIsLeader].wg.Wait()
+
+		inNeedOfResucitation := whoIsLeader
+		whoIsLeader = testFindNewLeader(n, wait, true)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		fmt.Println(" ***************  Bring up ", inNeedOfResucitation)
+		n[inNeedOfResucitation], err = testAddNode(nodes, inNeedOfResucitation, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		whoIsLeader = testFindNewLeader(n, wait, false)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		// Take two nodes out...
+		takeDown := []int{whoIsLeader, whoIsLeader + 1}
+		if takeDown[1] >= len(n) {
+			takeDown[1] = 0
+		}
+
+		fmt.Println(" ***************  Kill majority including leader", takeDown)
+		for i := range takeDown {
+			n[i].cancel()
+			n[i].cancel = nil
+		}
+
+		fmt.Println(" ***************  Restart killed nodes", takeDown)
+		for i := range takeDown {
+			n[i].wg.Wait() // wait for previous instance to finish coming down..., before we restart it.
+			n[i], err = testAddNode(nodes, i, electionPeriod)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		whoIsLeader = testFindNewLeader(n, wait, false)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		for i := 0; i < nodeCount; i++ {
+			if n[i] == nil {
+				continue
+			}
+			if n[i].cancel != nil {
+				fmt.Println("Cancelling: ", i)
+				n[i].cancel()
+			}
+			fmt.Println("Waiting for: ", i)
+			n[i].wg.Wait()
+		}
+	}
+}
+
 // ExampleMakeNode provides a simple example of how we kick off the Raft package,
 // and also how we can programmatically handle errors if we prefer to. It also shows how
 // asynchronous fatal errors in raft can be received and handled.
@@ -334,22 +537,14 @@ func ExampleMakeNode() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	//
-	// At a minimum, we need config to describe
-	//  1. cluster nodes
-	//  2. specify TLS or absence of it. We adopt the same stance as the grpc library;
-	//     no TLS has to be explicitly requested and we do not default to it.
-	//
-	// Note how in this example we rely on the default zap logger set up by raft. This logging can
-	// be disabled using  WithLogger(nil), or customised by specifying a logger instead of nil.
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
 	}
-
 	wg.Add(1)
-	n, err := MakeNode(ctx, &wg, cfg)
+	localIndex := int32(2) // say, if we are node3.example.com
+	n, err := MakeNode(ctx, &wg, cfg, localIndex)
 	if err != nil {
 
 		switch errors.Cause(err) {
@@ -398,10 +593,10 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
 	}
 
 	loggerCfg := DefaultZapLoggerConfig()
@@ -411,9 +606,12 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 	}
 
 	wg.Add(1)
-	n, err := MakeNode(ctx, &wg, cfg, WithLogger(logger, false))
+	n, err := MakeNode(ctx, &wg, cfg, 2,
+		WithLogger(logger, false),
+		WithLeaderTimeout(time.Second))
 	if err != nil {
 		/// handle error
+		return
 	}
 
 	//
@@ -454,9 +652,13 @@ func ExampleMakeNode_withTLSConfiguration() {
 
 	// We setup a configuration to enforce authenticating TLS client connecting to this node, and to validate
 	// server certificate in all client connections to remove cluster nodes.
-	nc := NewNodeConfig()
-	nc.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	nc.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
+	nc := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
+
+	clientDialOptionsFn := func(local, remote string) []grpc.DialOption {
 		tlsCfg := &tls.Config{
 			ServerName:   serverToName[remote],
 			Certificates: []tls.Certificate{localCert},
@@ -466,7 +668,8 @@ func ExampleMakeNode_withTLSConfiguration() {
 		}
 		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}
 	}
-	nc.ServerOptionsFn = func(local string) []grpc.ServerOption {
+
+	serverOptionsFn := func(local string) []grpc.ServerOption {
 		tlsCfg := &tls.Config{
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			Certificates: []tls.Certificate{localCert},
@@ -487,9 +690,14 @@ func ExampleMakeNode_withTLSConfiguration() {
 	}
 
 	wg.Add(1)
-	n, err := MakeNode(ctx, &wg, nc, WithLogger(l, true))
+	// if we are starting up node1.example.com, index would be 0
+	n, err := MakeNode(ctx, &wg, nc, 0,
+		WithClientDialOptionsFn(clientDialOptionsFn),
+		WithServerOptionsFn(serverOptionsFn),
+		WithLogger(l, true))
 	if err != nil {
 		// handle err
+		return
 	}
 
 	fmt.Printf("node started with config [%v]", n.config)
@@ -509,14 +717,13 @@ func ExampleMakeNode_withDefaultMetricsRegistry() {
 		// handle err
 	}
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
 	}
-
-	_, err = MakeNode(ctx, &wg, cfg,
-		WithMetrics(nil, true),
+	_, err = MakeNode(ctx, &wg, cfg, 1, // say if we are node2.example.com
+		WithMetrics(nil, "appFoo", true),
 		WithLogger(l, false))
 	if err != nil {
 		// handle error...
@@ -539,18 +746,18 @@ func ExampleMakeNode_withDedicatedMetricsRegistry() {
 		// handle err
 	}
 
-	cfg := NewNodeConfig()
-	cfg.Nodes = []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"}
-	cfg.ClientDialOptionsFn = func(local, remote string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
 	}
 
 	myregistry := prometheus.NewRegistry()
 	// Do remember to serve metrics by setting up the server which serves the prometheus handler
 	// obtained by handler := promhttp.HandlerFor(myregistry, promhttp.HandlerOpts{})
 
-	_, err = MakeNode(ctx, &wg, cfg,
-		WithMetrics(myregistry, true),
+	_, err = MakeNode(ctx, &wg, cfg, 1, // say we are node2.example.com
+		WithMetrics(myregistry, "appFoo", true),
 		WithLogger(l, false))
 	if err != nil {
 		/// handle error
@@ -562,6 +769,9 @@ func ExampleMakeNode_withDedicatedMetricsRegistry() {
 
 func getTestLogger() *zap.Logger {
 	cfg := DefaultZapLoggerConfig()
+	// Switch to human readable logs for test.
+	cfg.Encoding = "console"
+	cfg.DisableStacktrace = true
 	cfg.Level.SetLevel(zapcore.DebugLevel)
 	l, _ := cfg.Build()
 	return l
@@ -596,43 +806,53 @@ func testLoadCertPool(dir string) (*x509.CertPool, error) {
 	return certPool, nil
 }
 
-type testEventRequestVote struct {
-	request  *raft_pb.RequestVoteRequest
-	response *raft_pb.RequestVoteReply
+type testEventApplicationLoopback struct {
+	request  *raft_pb.AppNonce
+	response *raft_pb.AppNonce
 	err      error
 	client   *raftClient
-	wg       *sync.WaitGroup
+	done     chan struct{}
 }
 
-func (t *testEventRequestVote) handle(ctx context.Context) {
+func (t *testEventApplicationLoopback) handle(ctx context.Context) {
 	callCtx, cancel := context.WithTimeout(ctx, time.Second*3)
 	defer cancel()
-	t.response, t.err = t.client.grpcClient.RequestVote(callCtx, t.request)
-	t.wg.Done()
+
+	t.response, t.err = t.client.grpcClient.ApplicationLoopback(callCtx, t.request)
+	if t.err == nil {
+		if t.response.Nonce != t.request.Nonce {
+			t.err = fmt.Errorf("mismatched nonces; out %v, in %v",
+				t.request.Nonce, t.response.Nonce)
+		}
+	}
+	close(t.done)
 }
 
-func (t *testEventRequestVote) logKV() []interface{} {
-	return append(t.client.logKV(), "request", *t.request)
+func (t *testEventApplicationLoopback) logKV() []interface{} {
+	return append([]interface{}{"obj", "testEventApplicationLoopback", "request", *t.request}, t.client.logKV()...)
 }
 
-func evalForClientTimeout(ctx context.Context, nodes []*Node) error {
+func evalForApplicationLoopback(ctx context.Context, nodes []*Node) error {
 
 	for _, n := range nodes {
+
 		for _, cl := range n.messaging.clients {
-			e := testEventRequestVote{client: cl, wg: new(sync.WaitGroup), request: &raft_pb.RequestVoteRequest{}}
-			e.wg.Add(1)
-			// deadline will ensure it does not block forever.
-			cl.eventChannel <- &e
-			e.wg.Wait()
-			if e.err != nil {
-				// expect error other than timeout.
-				st, ok := status2.FromError(e.err)
-				if ok {
-					if st.Code() == codes.DeadlineExceeded {
-						return fmt.Errorf("RequestVort to %s returned deadline exceeded", cl.remoteAddress)
-					}
-				}
+
+			e := testEventApplicationLoopback{
+				client:  cl,
+				done:    make(chan struct{}),
+				request: &raft_pb.AppNonce{Nonce: 9898989}}
+			cl.eventChan.channel <- &e
+			select {
+			case <-time.After(time.Second * 5):
+				err := fmt.Errorf("ApplicationLoopback to %s timed out", cl.remoteAddress)
+				return err
+			case <-e.done:
 			}
+			if e.err != nil {
+				return fmt.Errorf("ApplicationLoopback to %s failed %v", cl.remoteAddress, e.err)
+			}
+
 		}
 	}
 	return nil
@@ -668,7 +888,7 @@ func (t *testEvent) waitForHitsOrTimeout(count int32, waitFor time.Duration) boo
 }
 
 func evalConnectedClients(ctx context.Context, nodes []*Node) error {
-	// Number of events we expect for full mesh of connectivity between nodes: n-1.
+	// Number of events we expect for full mesh of connectivity between nodes: node-1.
 	expect := len(nodes) - 1
 	for _, n := range nodes {
 		e := testEvent{name: "checkConn", count: atomic.NewInt32(0), wg: new(sync.WaitGroup)}
@@ -677,39 +897,175 @@ func evalConnectedClients(ctx context.Context, nodes []*Node) error {
 			// Identify whether we got past blocking connection for client by posting an event.
 			// On each node, if every connection is up, we should see expect number of hits on event.
 			select {
-			case cl.eventChannel <- &e:
+			case cl.eventChan.channel <- &e:
 			case <-time.After(time.Second):
 				return fmt.Errorf("At node %d, connection %d failed with timeout posting event",
-					n.messaging.server.index, cl.index)
+					n.index, cl.index)
 			}
 		}
-		eventsRxed := e.waitForHitsOrTimeout(int32(expect), time.Second)
+		eventsRxed := e.waitForHitsOrTimeout(int32(expect), time.Second*5)
 		if !eventsRxed {
 			return fmt.Errorf("At node %d, expected %d events, and got %d",
-				n.messaging.server.index, expect, e.count.Load())
+				n.index, expect, e.count.Load())
 		}
 	}
 	return nil
 }
 
-func testScrapeMetrics(url string) string {
+func testScrapeMetrics(index int32, path string) string {
+
+	url := fmt.Sprintf("http://localhost:%d%s", testMetricsBasePort+index, path)
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Sprint("FAILED TO SCRAPE METRICS ", url, err)
+		return fmt.Sprintf("FAILED TO GET METRICS url %s, err %v", url, err)
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 
 	if err != nil {
-		return fmt.Sprint("FAILED TO SCRAPE METRICS ", url, err)
+		return fmt.Sprintf("GET METRICS FROM %s RECEIVED ERROR %v", url, err)
 	}
 	return string(body)
 }
 
-func testSetupMetricsRegistryAndServer(endpoint, path string) (*prometheus.Registry, *http.Server) {
+// Manual parsing of results looking for metrics of interest.
+type scrapedMetric struct {
+	name   string
+	val    string
+	labels string
+}
 
-	// Setup prometheus endpoint on default registry.
+var testImmutableMetricsRegexp = regexp.MustCompile(`^([a-zA-Z0-9_:]*){([a-zA-Z0-9_:="]*)} (\w+)$`)
+
+func testScrapeMetricsAndExtract(index int32, path string, metrics []string) []*scrapedMetric {
+
+	metricsMap := map[string]bool{}
+	for _, m := range metrics {
+		metricsMap[m] = true
+	}
+
+	out := testScrapeMetrics(index, path)
+	lines := strings.Split(out, "\n")
+	var result []*scrapedMetric
+	for _, line := range lines {
+		// fmt.Println(line)
+		loc := testImmutableMetricsRegexp.FindSubmatch([]byte(line))
+		if len(loc) == 4 {
+			// (full match) metricName, labels, value
+			_, ok := metricsMap[string(loc[1])]
+			if ok {
+				result = append(result, &scrapedMetric{
+					name:   string(loc[1]),
+					val:    string(loc[3]),
+					labels: string(loc[2]),
+				})
+			}
+		}
+	}
+	return result
+}
+
+func testScrapeOneMetricAndExtract(index int32, path string, metric string) *scrapedMetric {
+
+	out := testScrapeMetrics(index, path)
+	lines := strings.Split(out, "\n")
+
+	for _, line := range lines {
+		loc := testImmutableMetricsRegexp.FindSubmatch([]byte(line))
+		if len(loc) == 4 {
+			// fmt.Println(string(loc[0]))
+			// (full match) metricName, labels, value
+			if string(loc[1]) == metric {
+				return &scrapedMetric{
+					name:   string(loc[1]),
+					val:    string(loc[3]),
+					labels: string(loc[2]),
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func testFindNewLeader(n []*testNode, duration time.Duration, majorityEnough bool) int {
+	var whoIsLeader int
+
+	done := make(chan struct{})
+	go func() {
+		<-time.After(duration)
+		close(done)
+	}()
+	bail := func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+
+		}
+		return false
+	}
+
+	for {
+		leader := 0
+		for i := 0; i < len(n); i++ {
+			if n[i] != nil {
+				results := testScrapeMetricsAndExtract(int32(i), "/metrics",
+					[]string{fmt.Sprintf("%s_raft_role", testMetricNamespace)})
+				if len(results) == 1 {
+					if results[0].val == "3" {
+						whoIsLeader = i
+						leader++
+					}
+				}
+			}
+		}
+		if leader != 1 {
+			time.Sleep(time.Second)
+			if bail() {
+				return noLeader
+			}
+			continue
+		}
+
+		//
+		// Now that we think we have a leader, let's see if the majority concur
+		leaderFollowers := 0
+		for i := 0; i < len(n); i++ {
+			if n[i] != nil {
+				result := testScrapeOneMetricAndExtract(int32(i), "/metrics",
+					fmt.Sprintf("%s_raft_leader", testMetricNamespace))
+				if result != nil {
+					if result.val == fmt.Sprintf("%d", whoIsLeader) {
+						leaderFollowers++
+					}
+				}
+			}
+		}
+		targetFollowers := len(n) - 1 // > test implies we have to have all of them.
+		if majorityEnough {
+			targetFollowers = len(n) >> 1
+		}
+		if leaderFollowers > targetFollowers {
+			break // we're done; we converged to 1 node
+		}
+		time.Sleep(time.Second)
+		if bail() {
+			fmt.Println("Test LEADER NOT FOUND")
+			return noLeader
+		}
+	}
+
+	fmt.Println("Test found LEADER: ", whoIsLeader)
+	return whoIsLeader
+}
+
+func testSetupMetricsRegistryAndServer(index int32, path string) (*prometheus.Registry, *http.Server) {
+
+	endpoint := fmt.Sprintf("localhost:%v", testMetricsBasePort+index)
+
+	// Setup prometheus endpoint on new registry.
 	metricsReg := prometheus.NewRegistry()
 	handler := promhttp.HandlerFor(metricsReg, promhttp.HandlerOpts{})
 
@@ -719,7 +1075,29 @@ func testSetupMetricsRegistryAndServer(endpoint, path string) (*prometheus.Regis
 		Addr:    endpoint,
 		Handler: handlerMux,
 	}
-	go metricServer.ListenAndServe()
+
+	go func() {
+		err := backoff.Retry(func() error {
+			err := metricServer.ListenAndServe()
+			if err != nil && err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		}, backoff.WithMaxRetries(backoff.NewConstantBackOff(time.Millisecond*5000), 3))
+		if err != nil {
+			panic(err)
+		}
+	}()
 
 	return metricsReg, metricServer
+}
+
+func testLoggerGet() *zap.Logger {
+
+	loggerCfg := DefaultZapLoggerConfig()
+	loggerCfg.Encoding = "console"
+	loggerCfg.Level.SetLevel(zapcore.DebugLevel)
+	logger, _ := loggerCfg.Build()
+
+	return logger
 }

@@ -2,35 +2,31 @@ package raft
 
 import (
 	"context"
-	"errors"
-	"github.com/ccassar/raft/raft_pb"
+	"github.com/ccassar/raft/internal/raft_pb"
+	"github.com/cenkalti/backoff"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
 	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
 	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
 
-const defaultInactivityTriggeredPingSeconds = 10
-const defaultTimeoutAfterPingSeconds = 10
+const defaultInactivityTriggeredPingSeconds = 1
+const defaultTimeoutAfterPingSeconds = 1
 
 // server implements the raft grpc service, server side.
 type raftServer struct {
 	// Cache the parent node so we can navigate up as necessary.
 	node *Node
-	// Immutable index of the local node in the cluster config, with local significance.
-	// (If the same configuration is used across nodes, then the index will match across nodes but
-	// it does NOT have to.)
-	index int
 	// The TCP listener used to register the raft server.
 	localListener net.Listener
 	// The addr in config.Nodes which has been claimed by this node, and against which we have set up
@@ -41,20 +37,80 @@ type raftServer struct {
 	eventChannel chan event
 }
 
-func (s *raftServer) AppendEntry(context.Context, *raft_pb.AppendEntryRequest) (*raft_pb.AppendEntryReply, error) {
-	return nil, status.Error(codes.Unimplemented, "AppendEntry not implemented yet")
+func (s *raftServer) AppendEntry(ctx context.Context, request *raft_pb.AppendEntryRequest) (
+	*raft_pb.AppendEntryReply, error) {
+
+	container := &appendEntryContainer{request: request, returnChan: make(chan *appendEntryContainer, 1)}
+
+	select {
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+	case s.node.engine.inboundAppendEntryChan <- container:
+		select {
+		case replyContainer := <-container.returnChan:
+			return replyContainer.reply, replyContainer.err
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+		}
+	}
 }
 
-func (s *raftServer) RequestVote(context.Context, *raft_pb.RequestVoteRequest) (*raft_pb.RequestVoteReply, error) {
-	return nil, status.Error(codes.Unimplemented, "RequestVote not implemented yet")
+func (s *raftServer) RequestVote(ctx context.Context, request *raft_pb.RequestVoteRequest) (
+	*raft_pb.RequestVoteReply, error) {
+	container := &requestVoteContainer{request: request, returnChan: make(chan *requestVoteContainer, 1)}
+
+	select {
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+	case s.node.engine.inboundRequestVoteChan <- container:
+		select {
+		case replyContainer := <-container.returnChan:
+			return replyContainer.reply, replyContainer.err
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+		}
+	}
 }
 
-func (s *raftServer) TimeoutRequest(context.Context, *raft_pb.TimeoutNowRequest) (*raft_pb.TimeoutNowReply, error) {
-	return nil, status.Error(codes.Unimplemented, "TimeoutRequest not implemented yet")
+func (s *raftServer) RequestTimeout(ctx context.Context, request *raft_pb.RequestTimeoutRequest) (
+	*raft_pb.RequestTimeoutReply, error) {
+	container := &requestTimeoutContainer{request: request, returnChan: make(chan *requestTimeoutContainer, 1)}
+
+	select {
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+	case s.node.engine.inboundRequestTimeoutChan <- container:
+		select {
+		case replyContainer := <-container.returnChan:
+			return replyContainer.reply, replyContainer.err
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+		}
+	}
+}
+
+func (s *raftServer) LogCommand(ctx context.Context, request *raft_pb.LogCommandRequest) (*raft_pb.LogCommandReply, error) {
+	container := &logCommandContainer{request: request, returnChan: make(chan *logCommandContainer, 1)}
+	select {
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+	case s.node.engine.inboundLogCommandChan <- container:
+		select {
+		case replyContainer := <-container.returnChan:
+			return replyContainer.reply, replyContainer.err
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.Aborted, "cluster node shutting down")
+		}
+	}
+}
+
+// raftServer.ApplicationLoopback is used exclusively in unit test.
+func (s *raftServer) ApplicationLoopback(ctx context.Context, in *raft_pb.AppNonce) (*raft_pb.AppNonce, error) {
+	return in, nil
 }
 
 func (s *raftServer) logKV() []interface{} {
-	return []interface{}{"obj", "localNode", "nodeIndex", s.index, "address", s.localAddr}
+	return []interface{}{"obj", "localNodeServer", "address", s.localAddr}
 }
 
 func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
@@ -65,17 +121,14 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	unaryInterceptorChain := []grpc.UnaryServerInterceptor{
 		grpc_ctxtags.UnaryServerInterceptor(),
-		grpc_zap.UnaryServerInterceptor(
-			n.logger.Desugar(),
-			grpc_zap.WithDecider(func(fullMethodName string, err error) bool {
-				// will not log gRPC calls if it was a call to healthcheck and no error was raised
-				if err == nil && fullMethodName == "" {
-					return false
-				}
+	}
 
-				// by default everything will be logged
-				return true
-			})),
+	if n.verboseLogging {
+		unaryInterceptorChain = append(unaryInterceptorChain,
+			grpc_zap.UnaryServerInterceptor(
+				n.logger.Named("GRPC_S").Desugar(),
+				// All results are forced to debug level
+				grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel })))
 	}
 
 	if n.messaging.serverUnaryInterceptorForMetrics != nil {
@@ -101,39 +154,39 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	//
 	// Append configured options so they can overwrite the defaults too.
-	if n.config.ServerOptionsFn != nil {
-		options = append(options, n.config.ServerOptionsFn(s.localAddr)...)
+	if n.config.serverOptionsFn != nil {
+		options = append(options, n.config.serverOptionsFn(s.localAddr)...)
 	}
 
 	s.grpcServer = grpc.NewServer(options...)
 	reflection.Register(s.grpcServer)
 	raft_pb.RegisterRaftServiceServer(s.grpcServer, s)
 
-	n.logger.Infow("gRPCServer starting up", s.logKV()...)
+	n.logger.Debugw("gRPCServer starting up", s.logKV()...)
 
-	// Wait for shutdown and graceful exit
 	go func() {
 		select {
 		case <-ctx.Done():
-			n.logger.Infow("gRPCServer graceful shut down requested", s.logKV()...)
+			n.logger.Debugw("gRPCServer graceful shut down requested", s.logKV()...)
 			s.grpcServer.GracefulStop()
 		}
 	}()
 
-	for {
-		err := s.grpcServer.Serve(s.localListener)
-		if err != nil {
-			// We should not receive an error if we exited gracefully; i.e. context cancellation. If we exit in error,
-			// we restart the server, after a short wait (backoff may be useful here).
-			err := raftErrorf(err, "gRPC server stopped serving unexpectedly")
-			n.logger.Errorw("gRPC Server exit", append(s.logKV(), raftErrKeyword, err)...)
-			// TODO Backoff...
-		} else {
-			// We're done...
-			break
-		}
+	err := backoff.RetryNotify(
+		func() error {
+			return s.grpcServer.Serve(s.localListener)
+		},
+		backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 0),
+		func(err error, next time.Duration) {
+			err = raftErrorf(err, "gRPC server stopped serving, will retry")
+			n.logger.Errorw(
+				"gRPC Server exit", append(s.logKV(), raftErrKeyword, err, "retryIn", next.String())...)
+		})
+	if err != nil {
+		n.logger.Errorw("gRPCServer shut down unexpectedly", append(s.logKV(), raftErrKeyword, err)...)
+	} else {
+		n.logger.Debugw("gRPCServer shut down gracefully", s.logKV()...)
 	}
-	n.logger.Infow("gRPCServer shut down gracefully", s.logKV()...)
 }
 
 // Given a configuration, we need to identify which address/protocol we can use. We are careful to iterate through
@@ -141,55 +194,72 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 // on to the one which is free.
 func initServer(ctx context.Context, n *Node) error {
 
-	errs := []string{}
+	if n.index < int32(len(n.config.Nodes)) {
 
-	for i, le := range n.config.Nodes {
-		listener, err := net.Listen("tcp", le)
-		if err == nil {
+		le := n.config.Nodes[n.index]
+		var listener net.Listener
 
-			s := &raftServer{
-				index:         i,
-				localListener: listener,
-				localAddr:     le,
-			}
+		err := backoff.Retry(
+			func() error {
+				var err error
+				listener, err = net.Listen("tcp", le)
+				return err
+			},
+			backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 3),
+		)
 
-			n.messaging.server = s
-			n.logger.Infow("listener acquired local node address", s.logKV()...)
-			return nil
+		// listener, err := net.Listen("tcp", le)
+		if err != nil {
+			err = raftErrorf(err, "failed to acquire local TCP socket for gRPC")
+			n.logger.Errorw("initServer failed (some other application or previous instance still using socket?)",
+				raftErrKeyword, err)
+			return err
 		}
-		// we expect to fail for all but one. We do not bother to be selective about which ones we try and
-		// simply rely on the failures trying to open socket for listening. Unless we fail to open any.
-		errs = append(errs, err.Error())
+
+		s := &raftServer{
+			node:          n,
+			localListener: listener,
+			localAddr:     le,
+		}
+
+		n.messaging.server = s
+		n.logger.Debugw("listener acquired local node address", s.logKV()...)
+
+	} else {
+
+		err := raftErrorf(
+			RaftErrorServerNotSetup, "LocalNodeIndex in out of bounds of cluster Nodes configuration")
+		n.logger.Errorw("initServer failed", raftErrKeyword, err)
+		return err
+
 	}
 
-	err := raftErrorf(errors.New(strings.Join(errs, ", ")), "failed to set up local TCP socket for gRPC")
-	n.logger.Errorw("listener failed to acquire node address", raftErrKeyword, err)
-
-	return err
+	return nil
 }
 
-// The raft client is very mechanical and simple. Its role is simply to offload the blocking gRPC calls. Every
-// event posted by the core raft component over the eventChannel is acknowledged with a return event - no ifs,
-// no buts... always.
+// The raft client is very mechanical and simple. Its role is simply to offload the blocking gRPC calls. In some cases
+// events posted by the core raft component over the channel is acknowledged with a return event. In other cases,
+// the event handler is more sophisticated - e.g. AppendEntry events are just wake-up notifications which then
+// result in the event handler, in the context of the client go routine, pulling and producing updates on demand.
 //
-// Note: if client is for a leader, it will be sent an AppendEntryRequest with no log message, every heartbeat
-// period if the appendEntryChannel is empty; otherwise we consider an AppendEntryRequest is scheduled already
-// so there is no need for an empty one to be sent.
 type raftClient struct {
+	// Cache the parent node so we can navigate up as necessary.
+	node *Node
 	// Immutable index of the cluster, with local significance. (If the same configuration is used
 	// across nodes, then the index will match across nodes but it does NOT have to.)
-	index int
+	index int32
 	// RemoteAddress is set at creation and immutable from there on.
 	remoteAddress string
 	// grpcClient tracks the grpcClient, and is only accessed in the run goroutine for the client.
 	grpcClient raft_pb.RaftServiceClient
-	// eventChannel is consumed in the run goroutine of the client, and produced too from the core
-	// raft.
-	eventChannel chan event
+	// flushable event channel receives all events that need disposing of. Event will carry all the context
+	// required to communicate with remote node and handle response. The client is as thin as can be and
+	// a simple way to enable async handling of events.
+	eventChan flushableEventChannel
 }
 
 func (c *raftClient) logKV() []interface{} {
-	return []interface{}{"obj", "remoteNode", "nodeIndex", c.index, "address", c.remoteAddress}
+	return []interface{}{"obj", "remoteNodeClient", "remoteNodeIndex", c.index, "address", c.remoteAddress}
 }
 
 // raftClient.run is a per remote node goroutine which will maintain a gRPC client connection to the remote node,
@@ -197,20 +267,17 @@ func (c *raftClient) logKV() []interface{} {
 func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	defer wg.Done()
 
-	n.logger.Infow("remote node client worker start running", c.logKV()...)
+	n.logger.Debugw("remote node client worker start running", c.logKV()...)
 
-	// Add grpc client interceptor for logging, and metrics collection (if enabled).
-
-	unaryInterceptorChain := []grpc.UnaryClientInterceptor{
-		grpc_zap.PayloadUnaryClientInterceptor(
-			n.logger.Desugar(), func(ctx context.Context, fullMethodName string) bool {
-				//
-				// Only log RequestVote messages
-				if fullMethodName == "/raft.RaftService/RequestVote" {
-					return true
-				}
-				return false
-			})}
+	// Add grpc client interceptor for logging, and metrics collection (if enabled). We do not use payload logging
+	// because it is currently nailed to InfoLevel.
+	gcl := n.logger.Named("GRPC_C").Desugar()
+	unaryInterceptorChain := []grpc.UnaryClientInterceptor{}
+	if c.node.verboseLogging {
+		unaryInterceptorChain = append(unaryInterceptorChain,
+			grpc_zap.UnaryClientInterceptor(
+				gcl, grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel })))
+	}
 
 	if n.messaging.clientUnaryInterceptorForMetrics != nil {
 		unaryInterceptorChain = append(unaryInterceptorChain, n.messaging.clientUnaryInterceptorForMetrics)
@@ -218,6 +285,7 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	// Prepend our options such that they can be overridden by the client options if they overlap.
 	options := []grpc.DialOption{
+		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    time.Second * defaultInactivityTriggeredPingSeconds,
 			Timeout: time.Second * defaultTimeoutAfterPingSeconds,
@@ -225,8 +293,8 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(unaryInterceptorChain...))}
 
 	// Append client provided dial options specifically for this client to server connection.
-	if n.config.ClientDialOptionsFn != nil {
-		options = append(options, n.config.ClientDialOptionsFn(n.messaging.server.localAddr, c.remoteAddress)...)
+	if n.config.clientDialOptionsFn != nil {
+		options = append(options, n.config.clientDialOptionsFn(n.messaging.server.localAddr, c.remoteAddress)...)
 	}
 
 	conn, err := grpc.DialContext(ctx, c.remoteAddress, options...)
@@ -241,27 +309,25 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		return
 	}
 
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
-	n.logger.Infow("remote node client worker connected",
+	n.logger.Debugw("remote node client worker connected",
 		append(c.logKV(), "connState", conn.GetState().String())...)
 	c.grpcClient = raft_pb.NewRaftServiceClient(conn)
 
 	for {
 		select {
-
-		case e := <-c.eventChannel:
+		case e := <-c.eventChan.channel:
 			// The event handler carries all the context necessary, and equally handles the
-			// feedback based on the outcome of the event. (The handler must also manage counting).
-			// (Logging is a bit expensive, but nice and consistent!)
-			n.logger.Debugw("client, dispatch event", append(c.logKV(), e.logKV()...)...)
+			// feedback based on the outcome of the event.
 			e.handle(ctx)
 
 		case <-ctx.Done():
 			// We're done. By this point we will have cleaned up and we're ready to go.
-			n.logger.Infow("remote node client worker shutting down", c.logKV()...)
+			n.logger.Debugw("remote node client worker shutting down", c.logKV()...)
 			return
 		}
+
 	}
 
 }
@@ -278,18 +344,19 @@ func initClients(ctx context.Context, n *Node) error {
 
 	// In this function, we set up a structure and channel for the remote nodes. We only set up the state - we do
 	// not fire up the goroutines for each node yet.
-	clients := []*raftClient{}
+	clients := map[int32]*raftClient{}
 	for i, remoteNodeAddress := range n.config.Nodes {
 		if remoteNodeAddress != n.messaging.server.localAddr {
 			client := &raftClient{
-				index:         i,
+				node:          n,
+				index:         int32(i),
 				remoteAddress: remoteNodeAddress,
-				// Event channel is how the core of the raft communicates with a gRPC client to the remote node
-				// associated with this client.
-				eventChannel: make(chan event, n.config.ChannelDepth.ClientEvents),
+				// Event channels is how the core of raft communicates with a gRPC client to the remote node
+				// associated with this client. The event itself carries all the handling context.
+				eventChan: NewFlushableEventChannel(n.config.channelDepth.clientEvents),
 			}
-			clients = append(clients, client)
-			n.logger.Infow("added remote node from configuration", client.logKV()...)
+			clients[int32(i)] = client
+			n.logger.Debugw("added remote node from configuration", client.logKV()...)
 
 		}
 	}
@@ -300,20 +367,20 @@ func initClients(ctx context.Context, n *Node) error {
 
 type raftMessaging struct {
 	server  *raftServer
-	clients []*raftClient
+	clients map[int32]*raftClient
 	//
 	// Metrics interceptors...
 	clientUnaryInterceptorForMetrics func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error
 	serverUnaryInterceptorForMetrics func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error)
-	// grpcLogger indicates whether client has requested grpc logging to be enabled or not.
-	grpcLogging bool
 }
 
 // initMessaging sets up both client workers used to push messages to cluster nodes, and server side handling of
 // messages sent to the local instance.
 func initMessaging(ctx context.Context, n *Node) error {
 
-	if n.messaging.grpcLogging {
+	n.logger.Debugw("raftMessaging, initialising", n.logKV()...)
+
+	if n.verboseLogging {
 		// Not quite from init functions because we let user control it, but early on enough.
 		grpc_zap.ReplaceGrpcLogger(n.logger.Desugar().Named("grpc"))
 	}
@@ -378,4 +445,5 @@ func runMessaging(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	wg.Add(1)
 	go n.messaging.server.run(ctx, wg, n)
+
 }

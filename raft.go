@@ -2,60 +2,77 @@ package raft
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"sync"
+	"time"
 )
 
-// NodeConfig is, well,  configuration for the local node. Package expects configuration to be passed in when starting
-// up the node using MakeNode.
+// NodeConfig is the mandatory configuration for the local node. Every field in NodeConfig must be provided by
+// application using the raft package. NodeConfig is passed in when starting up the node using MakeNode.
+// (Optional configuration can be passed in using WithX NodeOption options).
 type NodeConfig struct {
+	//
 	// Raft cluster node addresses. Nodes should include all the node addresses including the local one, in the
-	// form address:port. This makes configuration easy in that all nodes can share the same configuration. Each
-	// node will attempt to find a local address/port which works and registers to communicate over gRPC with
-	// both clients and other nodes on those ports if they work. Note that this works even when running multiple
-	// nodes on the same host - each node simply races to listen on a socket.
+	// form address:port. This makes configuration easy in that all nodes can share the same configuration.
 	//
 	// The order of the nodes (ignoring the local node) is also interpreted as the order of preference to transfer
 	// leadership to in case we need to transfer. Note that this tie breaker only kicks in amongst nodes
 	// which have a log matched to ours.
 	Nodes []string
 	//
+	// Application provides a channel over which committed log commands are published for the application to consume.
+	// The log commands are opaque to the raft package.
+	LogCmds chan []byte
+	//
+	// LogDB points at file location which is the home of the persisted logDB.
+	LogDB string
+	//
+	// Private fields below are set throught he WithX options passed in to make node.
+	//
 	// Pass in method which provides dial options to use when connecting as gRPC client with other nodes as servers.
 	// Exposing this configuration allows application to determine whether, for example, to use TLS in raft exchanges.
 	// The callback passes in the local node and remote node (as in Nodes above) for which we are setting up client
 	// connection.
-	ClientDialOptionsFn func(local, remote string) []grpc.DialOption
-	// Pass in method which provides server side grpc options. These will be merged in with default options, with
-	// default options overridden if provided in configuration. The callback passes in the node picked as local
-	// for this node. This is usually obvious except in cases (typically test) where multiple of the addresses in
-	// Nodes are local (in which case the first free available socket is used.
-	ServerOptionsFn func(local string) []grpc.ServerOption
+	clientDialOptionsFn func(local, remote string) []grpc.DialOption
 	//
-	// Channel depths, if not set will default to sensible values.
-	ChannelDepth struct {
-		ServerEvents int32
-		ClientEvents int32
+	// Pass in method which provides server side grpc options. These will be merged in with default options, with
+	// default options overridden if provided in configuration. The callback passes in the local node.
+	serverOptionsFn func(local string) []grpc.ServerOption
+	//
+	// Channel depths (optional). If not set, depths will default to sensible values.
+	channelDepth struct {
+		clientEvents int32
+		serverEvents int32
 	}
-}
-
-// NewNodeConfig returns a NodeConfig structure initialised with sensible defaults where possible. Caller,
-// will need to setup Nodes as a minimum before using NodeConfig in MakeNode.
-func NewNodeConfig() NodeConfig {
-
-	nc := NodeConfig{}
-
-	return nc
+	//
+	// Configurable raft timers.
+	timers struct {
+		// leaderTimeout is used to determine the maximum period which will elapse without getting AppendEntry
+		// messages from the leader. On the follower side, a random value between leaderTimeout and 2*leaderTimeout is
+		// used by the raft package to determine when to force an election. On the leader side, leader will attempt
+		// to send at least one AppendEntry (possible empty if necessary) within ever leaderTimeout period. Randomized
+		// election timeouts minimise the probability of split votes and resolves them quickly when they happen as
+		// described in Section 3.4 of CBTP. leaderTimeout defaults to 2s if not set.
+		leaderTimeout time.Duration
+		// gRPCTimeout is used to determine when we should give up on an attempt to invoke an RPC.
+		gRPCTimeout time.Duration
+	}
+	//
+	// Maximum size of batch of commands sent in AppendEntry. Defaults to 32 if not set.
+	logCmdBatchSize int32
 }
 
 const minNodesInCluster = 3
 
 // NodeConfig.validate: provides validation function for the configuration presented by user. Defaults are also
 // set if necessary.
-func (cfg *NodeConfig) validate() error {
+func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 
 	if len(cfg.Nodes) < minNodesInCluster {
 		return raftErrorf(
@@ -65,55 +82,68 @@ func (cfg *NodeConfig) validate() error {
 			cfg.Nodes, minNodesInCluster)
 	}
 
-	if cfg.ClientDialOptionsFn == nil {
+	if cfg.LogCmds == nil {
 		return raftErrorf(
 			RaftErrorMissingNodeConfig,
-			"no dial options method is provided in ClientDialOptionsFn, either TLS or grpc.WithInsecure() "+
-				"option must be provided. Raft does NOT default to insecure unless explicitly requested by application",
-			minNodesInCluster)
+			"missing LogCmds, a channel over which raft package will publish committed log commands")
 	}
 
-	if cfg.ChannelDepth.ClientEvents == 0 {
-		cfg.ChannelDepth.ClientEvents = 32
+	if int32(len(cfg.Nodes)) <= localNodeIndex {
+		return raftErrorf(
+			RaftErrorBadLocalNodeIndex,
+			"localNodeIndex specified %d is out of bounds for number endpoints specified in Nodes %d",
+			localNodeIndex, len(cfg.Nodes))
 	}
 
-	if cfg.ChannelDepth.ServerEvents == 0 {
-		cfg.ChannelDepth.ServerEvents = 32
+	if cfg.timers.leaderTimeout == 0 {
+		cfg.timers.leaderTimeout = time.Duration(2 * time.Second)
+	}
+
+	if cfg.timers.gRPCTimeout == 0 {
+		// No use waiting for much longer than this. Timeouts will be firing all over the place soon enough.
+		cfg.timers.gRPCTimeout = cfg.timers.leaderTimeout >> 1
+	}
+
+	if cfg.channelDepth.clientEvents == 0 {
+		cfg.channelDepth.clientEvents = 32
+	}
+
+	if cfg.channelDepth.serverEvents == 0 {
+		cfg.channelDepth.serverEvents = 32
+	}
+
+	if cfg.logCmdBatchSize == 0 {
+		cfg.logCmdBatchSize = 32
+	}
+
+	// Default to insecure dial options (i.e. no underlying TLS), with reasonable dial backoff and timeout options.
+	cfg.clientDialOptionsFn = func(l, r string) []grpc.DialOption {
+		return []grpc.DialOption{
+			grpc.WithInsecure(),
+			grpc.WithBackoffMaxDelay(cfg.timers.leaderTimeout >> 2), // default to connect 4x times within a timeout period
+		}
+	}
+
+	if cfg.LogDB == "" {
+		return raftErrorf(
+			RaftErrorMissingNodeConfig,
+			"missing LogDB, a file name where local node persists both metadata and log entries")
 	}
 
 	return nil
 }
 
-// followerNode objects are used by leader to track remote node state.
-type followerNode struct {
-}
-
-// This node will own a LeaderRole structure if it is a leader.
-type leaderRole struct {
-	followers []*followerNode
-	// resignToFirstMatchingFollower is set to true when we decide to transfer leadership.
-	// We have decided to resign. We implement the leadership transfer extension, and when a followed matches us,
-	// we resign by sending a TimeoutNow message.
-	resignToFirstMatchingFollower bool
-}
-
-// This node will own a followerRole structure if it is a follower.
-type followerRole struct {
-}
-
-// This node will own a candidateRole structure if it is a candidate.
-type candidateRole struct {
-}
-
 // Node tracks the state and configuration of this local node. Public access to services provided by node are concurrency
 // safe. Node structure carries the state of the local running raft instance.
 type Node struct {
+	// My index in the cluster. This attribute is set once and is immutable (i.e. can be accessed from anywhwere).
+	index int32
 	// Readonly state provided when the Node is created.
 	config *NodeConfig
-	// Server and client side state for messaging (independent of role). Messaging is message largely in raft_grpc.go.
+	// raftEngine implements the raft state machine.
+	engine *raftEngine
+	// Server and client side state for messaging (independent of role). Messaging is implemented largely in raft_grpc.go.
 	messaging *raftMessaging
-	// LeaderRole structure maintains leader role context when local node is a leader.
-	state nodeState
 	// fatalErrorFeedback feeds back fatal errors to the client.
 	// Do not push into channel directly; use signalFatalError().
 	fatalErrorFeedback chan error
@@ -125,6 +155,8 @@ type Node struct {
 	metrics *metricsHolder
 	// logger for Node, configurable through WithLogger, or WithPreConfiguredLogger options.
 	logger *zap.SugaredLogger
+	// Very low level debugging.
+	verboseLogging bool
 }
 
 // FatalErrorChannel returns an error channel which is used by the raft Node to signal an unrecoverable failure
@@ -144,7 +176,8 @@ func (n *Node) logKV() []interface{} {
 		kv = append(kv, n.messaging.server.logKV()...)
 	}
 
-	kv = append(kv, "clients", len(n.messaging.clients), "fatalErrorCount", n.fatalErrorCount.Load())
+	kv = append(kv, "obj", "localNode", "clients", len(n.messaging.clients),
+		"fatalErrorCount", n.fatalErrorCount.Load())
 
 	return kv
 }
@@ -166,6 +199,23 @@ func (n *Node) signalFatalError(err error) {
 	}
 }
 
+func (n *Node) mustGetClientFromId(clientIndex int32) *raftClient {
+	var rc *raftClient
+
+	defer func() {
+		if rc == nil {
+			n.signalFatalError(raftErrorf(
+				RaftErrorMustFailed, "fetching client %d expected to exist", clientIndex))
+		}
+	}()
+
+	if n != nil && n.messaging != nil {
+		rc = n.messaging.clients[clientIndex]
+	}
+
+	return rc
+}
+
 // NodeOption operator, operates on node to manage configuration.
 type NodeOption func(*Node) error
 
@@ -181,30 +231,103 @@ type NodeOption func(*Node) error
 // the appropriate node option. An example of exactly this use case is available in the godoc examples. In the example,
 // the logger configuration is set up to allow for on-the-fly changes to logging level.
 //
-// grpcLogs controls whether raft package redirects underlying gprc middleware logging to zap log. This is noisy, and
-// unless in depth gRPC troubleshooting is required, grpcLogToZap should be set to false.
-func WithLogger(logger *zap.Logger, grpcLogToZap bool) NodeOption {
+// verboseLogging controls whether raft package redirects underlying gprc middleware logging to zap log and includes
+// ultra low level debugging messages including keepalives. This makes debug very noisy, and unless in depth low level
+// message troubleshooting is required, verboseLogging should be set to false.
+func WithLogger(logger *zap.Logger, verboseLogging bool) NodeOption {
 	return func(n *Node) error {
 		if logger != nil {
 			n.logger = logger.Sugar()
 		} else {
 			n.logger = zap.NewNop().Sugar()
 		}
-		n.messaging.grpcLogging = grpcLogToZap
+		n.verboseLogging = verboseLogging
 
 		return nil
 	}
 }
 
-// WithMetrics option used with MakeNode to specify metrics registry we should count in. Detailed
-// option indicates whether detailed (and more expensive) metrics are tracked (e.g. grpc latency distribution).
+// WithMetrics option used with MakeNode to specify metrics registry we should count in. Argument namespace specifies
+// the namespace for the metrics. This is useful if the application prefixes all its metrics with a prefix. For
+// e.g. if namespace is 'foo', then all raft package metrics will be prefixed with 'foo.raft.'. Argument detailed
+// controls whether detailed (and more expensive) metrics are tracked (e.g. grpc latency distribution).
 // If nil is passed in for the registry, the default registry prometheus.DefaultRegisterer is used. Do note that
-// the package does not setup serving metrics; that is up to the application. The examples in godoc show how to
-// setup a custom metrics registry to log against. If the WithMetrics NodeOption is passed in to MakeNode, metrics
+// the package does not setup serving metrics; that is up to the application. Examples are included to show how to
+// setup a custom metrics registry to log against. If the WithMetrics NodeOption is NOT passed in to MakeNode, metrics
 // collection is disabled.
-func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
+func WithMetrics(registry *prometheus.Registry, namespace string, detailed bool) NodeOption {
 	return func(n *Node) error {
-		n.metrics = initMetrics(registry, detailed)
+		n.metrics = initMetrics(registry, namespace, detailed, n.index)
+		return nil
+	}
+}
+
+// WithLeaderTimeout used with MakeNode to specify leader timeout: leader timeout is used to determine the maximum period
+// which can elapse without getting AppendEntry messages from the leader without forcing a new election. On the follower
+// side, a random value between leaderTimeout and 2*leaderTimeout is used by the raft package to determine when to force
+// an election. On the leader side, leader will attempt to send at least one AppendEntry (possible empty if necessary)
+// within ever leaderTimeout period. Randomized election timeouts minimise the probability of split votes and resolves
+// them quickly when they happen as described in Section 3.4 of CBTP. LeaderTimeout defaults to 2s if not set.
+func WithLeaderTimeout(leaderTimeout time.Duration) NodeOption {
+	return func(n *Node) error {
+		n.config.timers.leaderTimeout = leaderTimeout
+		return nil
+	}
+}
+
+// WithUnaryGRPCTimeout used with MakeNode to specify timeout in gRPC RPC commands. By default, gRPC timeouts are set to
+// 5s.
+func WithUnaryGRPCTimeout(d time.Duration) NodeOption {
+	return func(n *Node) error {
+		n.config.timers.gRPCTimeout = d
+		return nil
+	}
+}
+
+// WithChannelDepthToClientOffload allows the application to overload the channel depth between the raft core engine,
+// and the goroutine which handles messaging to the remote nodes. A sensible default value (32) is used if this option is not
+// specified.
+func WithChannelDepthToClientOffload(depth int32) NodeOption {
+	return func(n *Node) error {
+		if depth <= 0 {
+			return errors.New("bad channel depth in WithChannelDepthToClientOffload, must be > 0")
+		}
+		n.config.channelDepth.clientEvents = depth
+		return nil
+	}
+}
+
+// WithLogCommandBatchSize sets the maximum number of log commands which can be sent in one AppendEntryRequest RPC.
+// Defaults to a sensible value (32) if not set.
+func WithLogCommandBatchSize(depth int32) NodeOption {
+	return func(n *Node) error {
+		if depth <= 0 {
+			return errors.New("bad batch size in WithLogCommandBatchSize, must be > 0")
+		}
+		n.config.logCmdBatchSize = depth
+		return nil
+	}
+}
+
+// WithServerOptionsFn sets up callback used to allow application to specify server side grpc options for local raft
+// node. These server options will be merged in with default options, with default options overwritten if provided
+// by callback. The callback passes in the local node as specified in the Nodes configuration. Server side options
+// could be used, for example, to set up mutually authenticated TLS protection of exchanges with other nodes.
+func WithServerOptionsFn(fn func(local string) []grpc.ServerOption) NodeOption {
+	return func(n *Node) error {
+		n.config.serverOptionsFn = fn
+		return nil
+	}
+}
+
+// WithClientDialOptionsFn sets up callback used to allow application to specify client side grpc options for local
+// raft node. These client options will be merged in with default options, with default options overwritten if provided
+// by callback. The callback passes in the local/remote node pair in the form specified in the Nodes configuration.
+// Client side options could be used, for example, to set up mutually authenticated TLS protection of exchanges
+// with other nodes.
+func WithClientDialOptionsFn(fn func(local, remote string) []grpc.DialOption) NodeOption {
+	return func(n *Node) error {
+		n.config.clientDialOptionsFn = fn
 		return nil
 	}
 }
@@ -218,18 +341,23 @@ func WithMetrics(registry *prometheus.Registry, detailed bool) NodeOption {
 // should be waited on by the caller before exiting following cancellation. Whether MakeNode returns successfully ot
 // not, WaitGroup will be marked Done() by the time the Node has cleaned up.
 //
+// The configuration block NodeConfig, along with localNodeIndex determine the configuration required to join the
+// cluster. The localNodeIndex determines the identity of the local node as an index into the list of nodes in
+// the cluster as specific in NodeConfig Nodes field.
+//
 // If MakeNode returns without error, than over its lifetime it will be striving to maintain
 // the node as a raft member in the raft cluster, and maintaining its replica of the replicated
 // log.
 //
-// If a fatal error is encountered this will be signalled over the fatalError channel.
-// A buffered channel of errors is provided to allow for raft package to signal fatal errors
-// upstream and allow client to determine best course of action; typically close context to shutdown.
+// If a fatal error is encountered at any point in the life of the node after MakeNode has returned, error will be
+// signalled over the fatalError channel. A buffered channel of errors is provided to allow for raft package to signal
+// fatal errors upstream and allow client to determine best course of action; typically close context to shutdown.
 // As in the normal shutdown case, following receipt of a fatal error, caller should cancel context and wait
 // for wait group before exiting. FatalErrorChannel method on the returned Node returns the error channel the
 // application should consume.
 //
-// MakeNode also accepts logging and metrics options (see WithMetrics and WithLogger).
+// MakeNode also accepts various options including, gRPC server and dial options, logging and metrics (see functions
+// returning NodeOption like WithMetrics, WithLogging etc).
 //
 // For logging, we would like to support structured logging. This makes specifying a useful
 // logger interface a little messier. Instead we depend on Uber zap and its interface, but allow user to
@@ -245,11 +373,12 @@ func MakeNode(
 	ctx context.Context,
 	wg *sync.WaitGroup,
 	cfg NodeConfig,
+	localNodeIndex int32,
 	opts ...NodeOption) (*Node, error) {
 
 	defer wg.Done()
 
-	err := cfg.validate()
+	err := cfg.validate(localNodeIndex)
 	if err != nil {
 		// We failed to initialise logging. We cannot log (obviously), so we simply return the error and
 		// bail.
@@ -257,6 +386,8 @@ func MakeNode(
 	}
 
 	n := &Node{
+		index:     localNodeIndex,
+		config:    &cfg,
 		messaging: &raftMessaging{},
 		// A single fatal error is sufficient to do the job. Create buffered channel of 1. This matters,
 		// because when we signal, where we to block, we would skip enqueuing signal on the basis we know at
@@ -282,11 +413,14 @@ func MakeNode(
 		return nil, raftErrorf(err, "init logging failed")
 	}
 
-	n.logger.Info("raft package, starting up (logging can be customised or disabled using WithLogger option)")
-
-	n.config = &cfg
+	n.logger.Info("raft package, hello (logging can be customised or disabled using WithLogger options)")
 
 	err = initMessaging(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+
+	err = initRaftEngine(ctx, n)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +428,7 @@ func MakeNode(
 	//
 	// We are ready to run. We will allocate our own context. We do this in order to handle the owner shutdown
 	// gracefully; specifically to orchestrate leadership transfer if we are leader on shutdown. Section 3.10 CBTP.
-	rootCtx, cancel := context.WithCancel(context.Background())
+	messagingCtx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
 
 	// Kick off messaging, remembering to add to the wait group. This ensures, that as long as client
@@ -303,34 +437,45 @@ func MakeNode(
 	wg.Add(1)
 
 	// Use and internal workgroup we can wait on so we can clean up (e.g. flush the logger) on exit.
-	var rootWg sync.WaitGroup
-	rootWg.Add(1)
-	runMessaging(rootCtx, &rootWg, n)
+	var messagingWg sync.WaitGroup
+	messagingWg.Add(1)
+	runMessaging(messagingCtx, &messagingWg, n)
+
+	engineCtx, engineCancel := context.WithCancel(context.Background())
+	var engineWg sync.WaitGroup
+	engineWg.Add(1)
+	go n.engine.run(engineCtx, &engineWg, n)
 
 	// Wait for owner shutdown, wait for clean shutdown, then return.
 	go func() {
 
 		select {
-		case <-rootCtx.Done():
+		case <-messagingCtx.Done():
 			n.logger.Info("raft package internal shutdown triggered")
 
 		case <-ctx.Done():
-			n.logger.Info("raft package owner is requesting a shutdown")
+			n.logger.Info("application is requesting a shutdown")
 		}
 
 		fec := n.fatalErrorCount.Load()
 		if fec == 0 {
 			n.blockOnGracefulShutdown()
 		} else {
-			n.logger.Info("raft skipping graceful shutdown because we have taken fatal errors already")
+			n.logger.Debug("raft skipping graceful shutdown because we have taken fatal errors already")
 		}
 
 		// cancel() will signal exit to all the goroutines spawned by raft package. These will in turn mark wait group done
 		// and let the owner eventually proceed.
 		cancel()
-		rootWg.Wait()
+		messagingWg.Wait()
+
+		// we can now kill engineWg now that messageing is shutdown.
+		engineCancel()
+		engineWg.Wait()
+
 		// flush the logger to make sure we get all the logs
-		n.logger.Sync()
+		n.logger.Info("raft package, goodbye")
+		_ = n.logger.Sync()
 		wg.Done()
 	}()
 
@@ -342,6 +487,10 @@ func (n *Node) blockOnGracefulShutdown() {
 	//
 	// TODO: send message to trigger graceful shutdown to the main state machine.
 	n.logger.Debugw("graceful shutdown, and triggering RequestTimeout is not implemented yet")
+}
+
+func (n *Node) keepalivePeriod() time.Duration {
+	return n.config.timers.leaderTimeout / 3
 }
 
 //
@@ -357,11 +506,10 @@ func DefaultZapLoggerConfig() zap.Config {
 	lcfg.DisableStacktrace = false
 	lcfg.DisableCaller = true
 	lcfg.Sampling = nil
-
 	return lcfg
 }
 
-// initLogging ensures that n.logger points at something even if it is pointing to a noop logger.
+// initLogging ensures that node.logger points at something even if it is pointing to a noop logger.
 // By default, we log to an opinionated pre-configured log. The WithLog option can override configuration
 // or disable logging completely.
 func initLogging(n *Node) error {
@@ -382,7 +530,7 @@ func initLogging(n *Node) error {
 
 	// Set logger name. This will end up being concatenated to a any preexisting log name. E.g. if the application
 	// provide its log named 'myapp', then logger field in logs from raft will be 'myapp.raft'.
-	n.logger = n.logger.Named("raft")
+	n.logger = n.logger.Named(fmt.Sprintf("raft.NODE%d", n.index))
 
 	//
 	// Logger set up already - nothing we need too do.
