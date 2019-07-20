@@ -99,8 +99,9 @@ Node1:00bdafa3-30d4-4be8-bb06-3472927ad00a
 Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
 ```
 
-A Dockerfile is provided, together with a helm chart to enable deployment of the application cluster as a kubernetes
-deployment. 
+A simple multistage Dockerfile [is provided](app/docker/Dockerfile), together with a helm chart to enable deployment of
+the application cluster as a kubernetes deployment are provided. The Dockerfile pulls the source from github, builds the
+test app executable in the first stage, and then builds an Ubuntu based image around the test application executable.
 
 
 ### Metrics
@@ -204,7 +205,8 @@ Todo next:
  - graceful handover on leader before shutdown
  - refactor TestLogReplication()
  - errors/utilisation/saturation metrics
- - deploy with helm chart and prometheus grafana dashboard on gke
+ - deploy with helm chart and prometheus grafana dashboard on gke, and docker compose based example for those running
+   locally.
 
 Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
 guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.

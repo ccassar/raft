@@ -172,11 +172,17 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		}
 	}()
 
+	boff := backoff.NewExponentialBackOff()
+	boff.InitialInterval = s.node.config.timers.leaderTimeout / 10
+	boff.MaxElapsedTime = 0
+	boff.MaxInterval = s.node.config.timers.leaderTimeout * 3
+	boff.Reset()
+
 	err := backoff.RetryNotify(
 		func() error {
 			return s.grpcServer.Serve(s.localListener)
 		},
-		backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 0),
+		backoff.WithMaxRetries(boff, 0),
 		func(err error, next time.Duration) {
 			err = raftErrorf(err, "gRPC server stopped serving, will retry")
 			n.logger.Errorw(

@@ -4,7 +4,7 @@
   "LeaderTimeout": "500ms",
   "LogCmdPeriod": "10s",
   "Metrics" : {
-    "Hostname": "localhost:9000",
+    "Endpoint": "localhost:9000",
     "Namespace": "myapp",
     "Path":"/metrics"
   }

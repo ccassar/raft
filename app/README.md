@@ -1,4 +1,4 @@
-### Test Application
+## Test Application
 
 The source in this application is a simple skeleton showing basic features of the raft package in action.
 Applications running in a cluster will all see a single version of a distributed log and can each contribute
@@ -30,4 +30,37 @@ Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
 By default, application logs to stderr, so redirecting stderr to file achieves the same end as `-zapFile` command line
 option.
 
+To build the docker image, from docker directory simply run the required variant of the following to build and run one
+instance (for any output you want to run the majority of the cluster - e.g. 2 out of 3-node application cluster):
 
+```
+docker build -t raftapp:`git describe --always --dirty` .
+```
+
+### Helm Deployment of Application Cluster to Kubernetes
+
+If cloud access to a kubernetes cluster is available, you can use the helm chart provided to deploy an application
+cluster quickly and with little effort.
+
+
+### Local Container Deployment
+
+Otherwise, an application cluster can be run locally as containers quite easily and quickly:
+
+```
+docker run -dt --name ra0 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:`git describe --always --dirty` /root/app --localNode=0 -debug -config=/root/cfg/app0.json
+docker run -dt --name ra1 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:`git describe --always --dirty` /root/app --localNode=1 -debug -config=/root/cfg/app1.json
+docker run -dt --name ra2 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:`git describe --always --dirty` /root/app --localNode=2 -debug -config=/root/cfg/app2.json
+```
+
+Note that in the example above, a file app<index>.json (with content similar to [app.json](test/app.json)) lives in the
+mounted configuration directory providing the configuration files. The only change required across the different nodes'
+configuration is the metrics endpoint port. Also note that in the example above we are sharing the host network stack.
+
+If running daemonised (with `-d` instead of interactive `-i` option), attach to an instance as follows;
+
+```
+docker attach ra2 --no-stdin
+```
+
+Detaching from the daemonised application will leave the container running.
