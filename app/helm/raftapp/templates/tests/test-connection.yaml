@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "raftapp.fullname" . }}-test-connection"
+  labels:
+{{ include "raftapp.labels" . | indent 4 }}
+  annotations:
+    "helm.sh/hook": test-success
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args:  ['{{ include "raftapp.fullname" . }}:{{ .Values.service.metrics.port }}']
+  restartPolicy: Never

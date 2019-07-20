@@ -34,23 +34,68 @@ To build the docker image, from docker directory simply run the required variant
 instance (for any output you want to run the majority of the cluster - e.g. 2 out of 3-node application cluster):
 
 ```
-docker build -t raftapp:`git describe --always --dirty` .
+# Replace tag with appropriate tag e.g. `git describe --always --dirty` or stable.
+docker build -t raftapp:<tag> .
 ```
 
 ### Helm Deployment of Application Cluster to Kubernetes
 
-If cloud access to a kubernetes cluster is available, you can use the helm chart provided to deploy an application
-cluster quickly and with little effort.
+If access to a kubernetes cluster is available, you can use the helm chart provided to deploy an application
+cluster quickly and with little effort. If the prometheus operator is setup, you can monitor the test application
+cluster using the dashboard provided. The simplest way of seeing the test application in action, is to run an application
+cluster in the cloud; for example on Google Kubernetes Engine (GKE), especially if you already have access to a
+kubernetes cluster with helm deployed.
+
+##### GKE Cluster Prerequisites
+
+You will need a Google Cloud account and to be running a cluster ([cheap, and possibly free, here](https://cloud.google.com/kubernetes-engine/docs/quickstart)).
+At a minimum, in order to support simple deployment of the application with helm, helm and tiller must be setup on the
+cluster. Again, thankfully, this is [easy and quick](https://docs.bitnami.com/kubernetes/get-started-gke/). Finally,
+in order to be able to monitor metrics on test application as you would in production for a real application, you
+may wish to deploy the (`prometheus-operator`)[https://github.com/helm/charts/tree/master/stable/prometheus-operator].
+This will scrape the test application automatically and serve grafana dashboards for the application cluster (as well
+as the underlying kubernetes cluster by default). The grafana admin account is set up by default with secret installed
+here: `kubectl get secret --namespace default monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 --decode `.
+Needless to say, for a real deployment, you should change access account details.
+
+Assuming the prometheus operator was deployed named `monitoring` in the `default` namespace as follows:
+```
+helm install --name monitoring stable/prometheus-operator
+```
+
+then port-forwarding to the local host on port 8080 can be setup as follows if ingress is not configured (and, by default,
+no ingress is set up for prometheus operator):
+
+```
+kubectl port-forward $(kubectl get pod --selector="app=grafana,release=monitoring" --output jsonpath='{.items[0].metadata.name}') 8080:3000
+```
+
+##### Deploying the Test Application on Google Kubernetes Engine
+
+Once the prerequisite cluster setup is in place, build the test app container in [docker](docker) directory locally as
+follows. PROJECT_ID is set to the gcloud project e.g. using `gcloud config get-value project`. Push the docker image
+to [Google Container Registry](https://cloud.google.com/container-registry/).
+
+```
+docker build -t gcr.io/${PROJECT_ID}/raftapp:stable .
+docker push gcr.io/${PROJECT_ID}/raftapp:stable
+```
+
+Once the image is built and pushed to the registry, in order to run the three node applications cluster, simply run the
+following deployments: `export NODEID=<0,1 or 2> ; helm install raftapp --name ra${NODEID} --set nodeid=${NODEID}`. Do note,
+that we do not currently preserve the data we must in a persistent volume, and as such is not a safe deployment beyond
+serving to illustrate the clustered behaviour.
 
 
 ### Local Container Deployment
 
-Otherwise, an application cluster can be run locally as containers quite easily and quickly:
+If access to GKE or equivalent is a problem, an application cluster can be run locally as containers quite easily and
+quickly assuming docker is deployed:
 
 ```
-docker run -dt --name ra0 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:`git describe --always --dirty` /root/app --localNode=0 -debug -config=/root/cfg/app0.json
-docker run -dt --name ra1 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:`git describe --always --dirty` /root/app --localNode=1 -debug -config=/root/cfg/app1.json
-docker run -dt --name ra2 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:`git describe --always --dirty` /root/app --localNode=2 -debug -config=/root/cfg/app2.json
+docker run -dt --name ra0 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:stable /root/app --localNode=0 -debug -config=/root/cfg/app0.json
+docker run -dt --name ra1 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:stable /root/app --localNode=1 -debug -config=/root/cfg/app1.json
+docker run -dt --name ra2 --net=host -v ${PWD}/cfgdir:/root/cfg/ raftapp:stable /root/app --localNode=2 -debug -config=/root/cfg/app2.json
 ```
 
 Note that in the example above, a file app<index>.json (with content similar to [app.json](test/app.json)) lives in the

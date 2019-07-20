@@ -1,0 +1,51 @@
+# Default values for raftapp.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: gcr.io/raft-246307/raftapp
+  tag: stable
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# nodeid must be specified at deployment time, and if it not, deployment will fail. A required directive is
+# embedded in the deployment accordingly.
+
+service:
+  raft:
+    type: ClusterIP
+    port: 10042
+    containerPort: 9042
+  metrics:
+    type: ClusterIP
+    port: 10043
+    containerPort: 9043
+
+
+ingress:
+  enabled: false
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+# In a real application cluster, we would set up inter-pod anti-affinity to ensure that no two application cluster nodes
+# land on the same underlying node.
+affinity: {}
