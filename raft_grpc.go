@@ -20,8 +20,8 @@ import (
 	"time"
 )
 
-const defaultInactivityTriggeredPingSeconds = 10
-const defaultTimeoutAfterPingSeconds = 10
+const defaultInactivityTriggeredPingSeconds = 1
+const defaultTimeoutAfterPingSeconds = 1
 
 // server implements the raft grpc service, server side.
 type raftServer struct {
@@ -121,12 +121,14 @@ func (s *raftServer) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 
 	unaryInterceptorChain := []grpc.UnaryServerInterceptor{
 		grpc_ctxtags.UnaryServerInterceptor(),
-		grpc_zap.UnaryServerInterceptor(
-			n.logger.Named("GRPC_S").Desugar(),
-			// All results are forced to debug level
-			grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel })),
-		// We could filter which messages are logged using WithDecider option. Eventually, we may
-		// expose this (and client side equivalent) as an option for application to control.
+	}
+
+	if n.verboseLogging {
+		unaryInterceptorChain = append(unaryInterceptorChain,
+			grpc_zap.UnaryServerInterceptor(
+				n.logger.Named("GRPC_S").Desugar(),
+				// All results are forced to debug level
+				grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel })))
 	}
 
 	if n.messaging.serverUnaryInterceptorForMetrics != nil {
@@ -270,9 +272,12 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 	// Add grpc client interceptor for logging, and metrics collection (if enabled). We do not use payload logging
 	// because it is currently nailed to InfoLevel.
 	gcl := n.logger.Named("GRPC_C").Desugar()
-	unaryInterceptorChain := []grpc.UnaryClientInterceptor{
-		grpc_zap.UnaryClientInterceptor(
-			gcl, grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel }))}
+	unaryInterceptorChain := []grpc.UnaryClientInterceptor{}
+	if c.node.verboseLogging {
+		unaryInterceptorChain = append(unaryInterceptorChain,
+			grpc_zap.UnaryClientInterceptor(
+				gcl, grpc_zap.WithLevels(func(code codes.Code) zapcore.Level { return zapcore.DebugLevel })))
+	}
 
 	if n.messaging.clientUnaryInterceptorForMetrics != nil {
 		unaryInterceptorChain = append(unaryInterceptorChain, n.messaging.clientUnaryInterceptorForMetrics)
@@ -304,7 +309,7 @@ func (c *raftClient) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		return
 	}
 
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	n.logger.Debugw("remote node client worker connected",
 		append(c.logKV(), "connState", conn.GetState().String())...)
@@ -367,8 +372,6 @@ type raftMessaging struct {
 	// Metrics interceptors...
 	clientUnaryInterceptorForMetrics func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error
 	serverUnaryInterceptorForMetrics func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error)
-	// grpcLogger indicates whether client has requested grpc logging to be enabled or not.
-	grpcLogging bool
 }
 
 // initMessaging sets up both client workers used to push messages to cluster nodes, and server side handling of
@@ -377,7 +380,7 @@ func initMessaging(ctx context.Context, n *Node) error {
 
 	n.logger.Debugw("raftMessaging, initialising", n.logKV()...)
 
-	if n.messaging.grpcLogging {
+	if n.verboseLogging {
 		// Not quite from init functions because we let user control it, but early on enough.
 		grpc_zap.ReplaceGrpcLogger(n.logger.Desugar().Named("grpc"))
 	}

@@ -228,17 +228,17 @@ func (e *logCmdEvent) handle(ctx context.Context) {
 		e.container.reply.Ack = false
 		e.container.err = raftErrorf(RaftErrorLogCommandLocalDrop, "event channel to gRPC client flushed")
 	} else {
-		// We derive context from application context, so application can also cancel request.
-		appCtxWithDeadline, cancel := context.WithTimeout(e.container.appCtx, e.client.node.config.timers.gRPCTimeout)
+		// We derive context from application context, so application controls cancellation (except if we are shutting down).
+		appCtxWithCancel, cancel := context.WithCancel(e.container.appCtx)
 		defer cancel()
 		go func() {
 			defer cancel()
 			select {
 			case <-ctx.Done():
-			case <-appCtxWithDeadline.Done():
+			case <-appCtxWithCancel.Done():
 			}
 		}()
-		e.container.reply, e.container.err = e.client.grpcClient.LogCommand(appCtxWithDeadline, e.container.request)
+		e.container.reply, e.container.err = e.client.grpcClient.LogCommand(appCtxWithCancel, e.container.request)
 	}
 	// Dedicated slot in buffered channel waiting for response so this never blocks.
 	e.container.returnChan <- e.container

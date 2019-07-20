@@ -273,7 +273,7 @@ func (re *raftEngine) loadNodePersistedData() error {
 		ps := raft_pb.PersistedState{}
 		err := proto.Unmarshal(stream, &ps)
 		if err == nil {
-			re.currentTerm.Store(ps.CurrentTerm)
+			re.updateCurrentTerm(ps.CurrentTerm)
 			re.votedFor.Store(ps.VotedFor)
 		}
 
@@ -283,7 +283,7 @@ func (re *raftEngine) loadNodePersistedData() error {
 	if err != nil {
 		if errors.Cause(err) == RaftErrorNodePersistentData {
 			// Let's initialise persisted state for the first time and save it.
-			re.currentTerm.Store(termNotSet)
+			re.updateCurrentTerm(termNotSet)
 			re.replaceTermIfNewer(0)
 			return nil
 		}
@@ -336,7 +336,10 @@ func (re *raftEngine) initLogDB(ctx context.Context, n *Node) error {
 	// We start by purging any preexisting log entries if they exist. Eventually we will use the persisted
 	// log for initial checkpoint, but not yet.
 	err = ldb.Update(func(tx *bolt.Tx) error {
-		tx.DeleteBucket([]byte(dbBucketLog))
+		err = tx.DeleteBucket([]byte(dbBucketLog))
+		if err != nil && err != bolt.ErrBucketNotFound {
+			return err
+		}
 		return nil
 	})
 

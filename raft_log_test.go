@@ -205,3 +205,165 @@ func TestAcknowledgements(t *testing.T) {
 	}
 
 }
+
+func TestLogReplication(t *testing.T) {
+
+	electionPeriod := time.Millisecond * 500
+	wait := electionPeriod * 30
+	nodeCount := 3
+	for i := 0; i < nodeCount; i++ {
+		os.Remove(fmt.Sprintf("test/boltdb.%d", i))
+	}
+
+	n := make([]*testNode, nodeCount)
+	nodes := []string{":8088", ":8089", ":8090"}
+	var err error
+
+	for i := 0; i < len(nodes); i++ {
+		fmt.Println(" ***************  Bring up ", i)
+		n[i], err = testAddNode(nodes, i, electionPeriod)
+		if err != nil {
+			t.Fatal("failed to start node")
+		}
+	}
+
+	// Produce an entry at the leader first and receive it, elsewhere.
+	leaderIndex := testFindNewLeader(n, wait, false)
+	if leaderIndex == noLeader {
+		t.Fatal("failed to elect a leader")
+	}
+
+	producerIndex := leaderIndex + 1
+	if producerIndex >= len(n) {
+		producerIndex = 0
+	}
+
+	messages := 100
+	msgContent := "Daisy, daisy..."
+
+	// Test both producing from follower and producing from leader...
+	producers := []*Node{n[producerIndex].node, n[leaderIndex].node}
+	for _, producer := range producers {
+		fmt.Printf(" ***************  Producing msg from %d to %d: %s\n", producerIndex, leaderIndex, string(msgContent))
+
+		produced := 0
+		for msgCount := 0; msgCount < messages; msgCount++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = producer.LogProduce(ctx, []byte(msgContent))
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			produced++
+		}
+		fmt.Printf(" ***************  Produced %d msgs from %d to %d: %s\n",
+			produced, producerIndex, leaderIndex, string(msgContent))
+
+		//
+		// Next... let's collect the result from all...
+		for msgCount := 0; msgCount < messages; msgCount++ {
+			for i := 0; i < nodeCount; i++ {
+				select {
+				case msg := <-n[i].node.config.LogCmds:
+					if string(msg) != msgContent {
+						t.Fatal("expected v rxed: ", string(msgContent), string(msg))
+					}
+				}
+			}
+		}
+	}
+
+	// Destroy leader node and exercise resync...
+	fmt.Println("Destroying leader:", leaderIndex)
+	n[leaderIndex].cancel()
+	n[leaderIndex].wg.Wait()
+	fmt.Println("Resuscitating old leader node:", leaderIndex)
+	n[leaderIndex], err = testAddNode(nodes, leaderIndex, electionPeriod)
+	for msgCount := 0; msgCount < messages*len(producers); msgCount++ {
+		select {
+		case msg := <-n[leaderIndex].node.config.LogCmds:
+			if string(msg) != msgContent {
+				t.Fatal("expected v rxed: ", string(msgContent), string(msg))
+			}
+		}
+	}
+
+	fmt.Println(" ***************  Test recovery of follower with missed updates")
+	fmt.Println(" ***************  Destroying follower (used to be leader):", leaderIndex)
+	n[leaderIndex].cancel()
+	n[leaderIndex].wg.Wait()
+
+	fmt.Printf(" ***************  Producing msg from %d: %s\n", producerIndex, string(msgContent))
+	producer := n[producerIndex]
+	produced := 0
+	for msgCount := 0; msgCount < messages; msgCount++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = producer.node.LogProduce(ctx, []byte(msgContent))
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		produced++
+	}
+	fmt.Printf(" ***************  Produced %d msgs from %d: %s\n",
+		produced, producerIndex, string(msgContent))
+
+	fmt.Println("Resuscitating old follower (user to be leader) node:", leaderIndex)
+	n[leaderIndex], err = testAddNode(nodes, leaderIndex, electionPeriod)
+
+	for msgCount := 0; msgCount < messages*(len(producers)+1); msgCount++ {
+		select {
+		case msg := <-n[leaderIndex].node.config.LogCmds:
+			if string(msg) != msgContent {
+				t.Fatal("expected v rxed: ", string(msgContent), string(msg))
+			}
+		}
+	}
+
+	fmt.Println(" ***************  Shutting down")
+	for i := 0; i < nodeCount; i++ {
+		if n[i] == nil {
+			continue
+		}
+		if n[i].cancel != nil {
+			fmt.Println("Cancelling: ", i)
+			n[i].cancel()
+		}
+		fmt.Println("Waiting for: ", i)
+		n[i].wg.Wait()
+	}
+
+}
+
+func ExampleNode_LogProduce() {
+
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cfg := NodeConfig{
+		Nodes:   []string{"node1.example.com:443", "node2.example.com:443", "node3.example.com:443"},
+		LogCmds: make(chan []byte, 32),
+		LogDB:   "mydb.bbolt",
+	}
+	wg.Add(1)
+	localIndex := int32(2) // say, if we are node3.example.com
+	n, err := MakeNode(ctx, &wg, cfg, localIndex)
+	if err != nil {
+	}
+
+	// Kick off handling of LogCmds and FatalErrorChannel().
+	// ...
+	//
+	// Produce log command to distributed log.
+	ctxLogProduce, cancel := context.WithTimeout(ctx, 3*time.Second)
+	err = n.LogProduce(ctxLogProduce, []byte("I'm sorry Dave..."))
+	cancel()
+	if err != nil {
+		// Do retry here, preferably using exponentially backoff.
+	}
+
+	// When we're done...
+	cancel()
+	wg.Wait()
+}

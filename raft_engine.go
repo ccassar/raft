@@ -179,22 +179,24 @@ func (a orderedCandidates) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a orderedCandidates) Less(i, j int) bool { return a[i] < a[j] }
 
 func (l *raftEngineLeader) maintainCommittedIndexForLeader() {
-	oc := make(orderedCandidates, 0, len(l.clients))
+	oc := make(orderedCandidates, len(l.clients))
 	for i, cal := range l.clients {
 		oc[i] = cal.matchIndex.Load()
 	}
 
-	nodeToCheck := len(l.engine.node.config.Nodes)>>1 - 1
+	count := len(l.engine.node.config.Nodes)
+	nodeToCheck := (count / 2) + (count % 2)
 	sort.Sort(oc)
 
-	// committed index can be no better than the last acknoledged loge entry of the middle - 1 remote node. We know
+	// committed index can be no better than the last acknowledged log entry of the middle remote node. We know
 	// more than the majority have acknowledged that value.
-	l.engine.updateCommittedIndexIfNecessary(oc[nodeToCheck])
+	if l.engine.updateCommittedIndexIfNecessary(oc[nodeToCheck]) {
 
-	//
-	// Wake up acker if necessary. Acker will be scheduled to run and validate whether any pending acks need to be
-	// issued to local terminated or remote applications.
-	l.acker.notify()
+		//
+		// Wake up acker if necessary. Acker will be scheduled to run and validate whether any pending acks need to be
+		// issued to local terminated or remote applications.
+		l.acker.notify()
+	}
 }
 
 // raftEngineLeader tracks state pertinent to when a node is in leader state. When node transitions to
@@ -208,7 +210,7 @@ type raftEngineLeader struct {
 
 const noLeader = -1
 const notVotedThisTerm = -1
-const indexNotSet = int64(-1)
+const indexNotSet = int64(0)
 const termNotSet = int64(0)
 
 type requestVoteContainer struct {
@@ -315,6 +317,13 @@ func (re *raftEngine) updateState(state nodeState) {
 		strings.ToUpper(state.String())), re.logKV()...)
 }
 
+func (re *raftEngine) updateCurrentTerm(t int64) {
+	re.currentTerm.Store(t)
+	if re.node.metrics != nil {
+		re.node.metrics.term.Set(float64(t))
+	}
+}
+
 func (re *raftEngine) updateCurrentLeader(l int32) {
 	oldLeader := re.currentLeader.Load()
 	re.currentLeader.Store(l)
@@ -349,6 +358,8 @@ func (re *raftEngine) run(ctx context.Context, wg *sync.WaitGroup, n *Node) {
 		updatesAvailable: make(chan struct{}, 1),
 		logCmdChannel:    re.node.config.LogCmds,
 	}
+
+	re.publisher = lp
 	wg.Add(1)
 	go lp.run(ctx, wg)
 
@@ -374,7 +385,7 @@ const (
 
 func (re *raftEngine) updateVotedFor(candidate int32) {
 	re.votedFor.Store(candidate)
-	re.saveNodePersistedData()
+	_ = re.saveNodePersistedData()
 }
 
 // replaceTrainIfNewer will test current against received term. There are three possible outcomes;
@@ -390,9 +401,9 @@ func (re *raftEngine) replaceTermIfNewer(rxTerm int64) termComparisonResult {
 	switch {
 	case rxTerm > currentTerm:
 		// update currentTerm and votedFor - this will result in the persistent data being updated.
+		re.updateCurrentTerm(rxTerm)
 		re.updateVotedFor(notVotedThisTerm)
 		re.updateCurrentLeader(int32(noLeader))
-		re.currentTerm.Store(rxTerm)
 		re.node.logger.Debugw("raftEngine declaring new CurrentTerm", re.logKV()...)
 
 		return newTerm
@@ -462,9 +473,10 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 		re.updateVotedFor(re.node.index)
 
 		leaderTimeout := randomiseDuration(re.node.config.timers.leaderTimeout)
-		re.node.logger.Debugw("raftEngine candidate, extending leader timeout",
-			append(re.logKV(), "period", leaderTimeout.String())...)
-
+		if re.node.verboseLogging {
+			re.node.logger.Debugw("raftEngine candidate, extending leader timeout",
+				append(re.logKV(), "period", leaderTimeout.String())...)
+		}
 		if ltTimer == nil {
 			ltTimer = time.NewTimer(leaderTimeout)
 		} else {
@@ -653,17 +665,27 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 			}
 
 		case msg := <-re.inboundLogCommandChan:
+
+			re.node.logger.Debugw(
+				"raftEngine leader, LogCommand rxed from application (via remote node)",
+				append(re.logKV(), "origin", msg.request.Origin)...)
 			re.handleLogCommandContainer(ctx, msg)
 
 		case msg := <-re.localLogCommandChan:
+
+			re.node.logger.Debugw(
+				"raftEngine leader, LogCommand rxed from application (local)",
+				append(re.logKV(), "origin", msg.request.Origin)...)
 			re.handleLogCommandContainer(ctx, msg)
 
 		case clientIndex := <-re.leaderState.clientKeepaliveDue:
 
 			client, ok := re.node.messaging.clients[clientIndex]
 			if ok {
-				re.node.logger.Debugw("raftEngine leader, send keepalive",
-					append(re.logKV(), "remoteNodeIndex", clientIndex)...)
+				if re.node.verboseLogging {
+					re.node.logger.Debugw("raftEngine leader, send keepalive",
+						append(re.logKV(), "remoteNodeIndex", clientIndex)...)
+				}
 				client.eventChan.postMessageWithFlush(
 					ctx, &appendEntryEvent{client: client, cal: re.leaderState.clients[clientIndex]})
 			}
@@ -672,12 +694,12 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 		case msg := <-re.returnsAppendEntryResponsesFromClientChan:
 
 			// Why are we here? The client go routine handles sending the AppendEntry requests to
-			// the client. It does forward up results when a) they result in update to matchIndex which
+			// the client. It does forward up results when a) they result in an update to matchIndex which
 			// should cause us to reevaluate our committedIndex, b) on failure if retry is required...
 			// going through the raft engine ensures retries are only rescheduled while we remain
 			// leaders c) in the case it gets terms back which do not match our current term.
 			//
-			// TODO We need to introduce exponential backoff here.
+			// Any retries required are scheduled to next keepalive.
 			if msg.err != nil {
 				switch errors.Cause(msg.err) {
 				case raftErrorMismatchedTerm:
@@ -685,9 +707,8 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 					switch re.replaceTermIfNewer(msg.reply.Term) {
 					case staleTerm:
 						re.node.logger.Debugw(
-							"raftEngine leader, ignoring AppendEntry reply from stale remote client, will retry",
+							"raftEngine leader, ignoring AppendEntry reply from stale remote client, will retry on keepalive",
 							append(re.logKV(), "remoteNodeIndex", msg.request.To)...)
-						re.leaderState.notifyClientToProduceAppendEntries(ctx, msg.request.To)
 						continue
 
 					case newTerm:
@@ -698,10 +719,11 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 					}
 
 				default:
+
+					// In retry territory... simply wait for keepalive if we failed.
 					re.node.logger.Debugw(
-						"raftEngine leader, error AppendEntry reply for remote client, will retry",
+						"raftEngine leader, error AppendEntry reply for remote client, will retry on keepalive",
 						append(re.logKV(), "remoteNodeIndex", msg.request.To, raftErrKeyword, msg.err)...)
-					re.leaderState.notifyClientToProduceAppendEntries(ctx, msg.request.To)
 				}
 				continue
 			}
@@ -819,9 +841,10 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 	for {
 
 		leaderTimeout := randomiseDuration(re.node.config.timers.leaderTimeout)
-		re.node.logger.Debugw("raftEngine follower, extending leader timeout",
-			append(re.logKV(), "period", leaderTimeout.String())...)
-
+		if re.node.verboseLogging {
+			re.node.logger.Debugw("raftEngine follower, extending leader timeout",
+				append(re.logKV(), "period", leaderTimeout.String())...)
+		}
 		if ltTimer == nil {
 			ltTimer = time.NewTimer(leaderTimeout)
 		} else {
@@ -880,8 +903,13 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 			case msg := <-re.localLogCommandChan:
 
 				leader := re.currentLeader.Load()
+				re.node.logger.Debugw(
+					"raftEngine follower, LogCommand rxed from application (local)",
+					append(re.logKV(), "origin", msg.request.Origin, "forwardTo", leader)...)
+
 				var pushed bool
-				if leader < int32(len(re.node.messaging.clients)) && leader >= 0 {
+				clientCount := len(re.node.config.Nodes)
+				if leader < int32(clientCount) && leader >= 0 {
 					client := re.node.messaging.clients[leader]
 					logCmdEv := &logCmdEvent{client: client, container: msg}
 					pushed = client.eventChan.postMessage(ctx, logCmdEv)
@@ -894,7 +922,8 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 					}
 				} else {
 					msg.err = raftErrorf(
-						RaftErrorLogCommandLocalDrop, "no gRPC client for leader [%d]", leader)
+						RaftErrorLogCommandLocalDrop, "no gRPC client for leader index/client count [%d/%d]",
+						leader, clientCount)
 					re.node.logger.Debugw(
 						"raftEngine candidate, skipped sending logCmd to remote leader",
 						append(re.logKV(), "leader", leader)...)
@@ -986,16 +1015,24 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 			// case where no new log entries are added after a new election - only the keepalive is available for
 			// follower to force log sync up with leader).
 			firstEntry := msg.request.PrevLogIndex == 0 && msg.request.PrevLogTerm == 0
-			le, err := re.logGetEntry(msg.request.PrevLogIndex)
+			var le *raft_pb.LogEntry
+			if firstEntry { // create dummy last entry to pass test of prev entry if first entry
+				le = &raft_pb.LogEntry{Sequence: msg.request.PrevLogIndex, Term: msg.request.PrevLogTerm}
+			} else {
+				le, err = re.logGetEntry(msg.request.PrevLogIndex)
+			}
 			if err == nil {
-				if firstEntry || le != nil {
-					if firstEntry || le.Term == msg.request.PrevLogTerm {
+				if le != nil {
+					if le.Term == msg.request.PrevLogTerm {
 						//
 						// Looks like we're in business. We need to handle the fact that we may have some new entries
 						// to add (and possibly some to clear). Append all new entries, and purge any remaining ones if
 						// AND ONLY IF we encounter a term/sequence discrepancy (as per Figure 2, Step 3 in ISUCA).
 						outcome = accepted
 						ack = true
+
+						// Set latest sequence to where we currently are...
+						latestSequenceAdded = le.Sequence
 
 						for _, newLe := range msg.request.LogEntry {
 							var existingLe *raft_pb.LogEntry
@@ -1048,7 +1085,7 @@ func (re *raftEngine) handleRxedAppendEntry(msg *appendEntryContainer, okInTerm 
 	return outcome
 }
 
-func (re *raftEngine) updateCommittedIndexIfNecessary(c int64) {
+func (re *raftEngine) updateCommittedIndexIfNecessary(c int64) bool {
 	if re.commitIndex.Load() < c {
 		// Updates only happen on the raftEngine goroutine, so it is ok to simply store the new value.
 		// We do need to notify the publisher that new commits are available assuming prior notification
@@ -1058,7 +1095,13 @@ func (re *raftEngine) updateCommittedIndexIfNecessary(c int64) {
 		re.node.logger.Debugw("raftEngine updating commitIndex", re.logKV()...)
 		re.commitIndex.Store(c)
 		re.publisher.notify()
+		if re.node.metrics != nil {
+			re.node.metrics.committedIndex.Set(float64(c))
+		}
+		return true
 	}
+
+	return false
 }
 
 // countVote accumulates vote for voter along with the rest, and returns true if we have a majority.

@@ -59,13 +59,17 @@ outerLoop:
 				select {
 				case pub.logCmdChannel <- le.Data:
 					re.lastApplied.Store(index)
+					if re.node.metrics != nil {
+						re.node.metrics.lastApplied.Set(float64(index))
+					}
 				case <-ctx.Done():
 					break outerLoop
 				}
 				count++
 			}
 
-			re.node.logger.Debugw("log command publisher", append(pub.logKV(), "published", count))
+			re.node.logger.Debugw("log command publisher", append(pub.logKV(), "publishedCountThisRound", count,
+				"toCommitIndex", target)...)
 
 		case <-ctx.Done():
 			break outerLoop

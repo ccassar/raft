@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"github.com/ccassar/raft/internal/raft_pb"
+	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -299,21 +300,16 @@ func TestInitLogging(t *testing.T) {
 
 func TestInitMessaging(t *testing.T) {
 
-	l, err := DefaultZapLoggerConfig().Build()
-	if err != nil {
-		t.Error("failed to set up logging for test. ", err)
-	}
-
 	n := &Node{
 		index:           1,
-		logger:          l.Sugar(),
+		logger:          testLoggerGet().Sugar(),
 		fatalErrorCount: atomic.NewInt32(0),
 		config: &NodeConfig{Nodes: []string{
 			"1.2.3.4:12345",
 			":8989", // we expect this to be picked based on index.
 		}}}
 
-	err = initClients(nil, n)
+	err := initClients(nil, n)
 	if err == nil {
 		t.Errorf("expected initClient on %s nodes to fail", n.config.Nodes[0])
 	} else if errors.Cause(err) != RaftErrorServerNotSetup {
@@ -321,7 +317,7 @@ func TestInitMessaging(t *testing.T) {
 			n.config.Nodes[0], RaftErrorServerNotSetup, err)
 	}
 
-	n.messaging = &raftMessaging{grpcLogging: false}
+	n.messaging = &raftMessaging{}
 	err = initMessaging(nil, n)
 	if err != nil {
 		t.Errorf("expected socket on %s to open, but failed [%v]",
@@ -355,11 +351,11 @@ type testNode struct {
 	node   *Node
 }
 
-func testAddNode(nodes []string, i int) (*testNode, error) {
-	return testAddNodeWithDB(nodes, i, "")
+func testAddNode(nodes []string, i int, electionPeriod time.Duration) (*testNode, error) {
+	return testAddNodeWithDB(nodes, i, "", electionPeriod)
 }
 
-func testAddNodeWithDB(nodes []string, i int, db string) (*testNode, error) {
+func testAddNodeWithDB(nodes []string, i int, db string, electionPeriod time.Duration) (*testNode, error) {
 
 	var err error
 
@@ -388,7 +384,9 @@ func testAddNodeWithDB(nodes []string, i int, db string) (*testNode, error) {
 	tn.wg.Add(1)
 	tn.node, err = MakeNode(tn.ctx, &tn.wg, tn.nc, int32(i),
 		WithLogger(l, false),
-		WithLeaderTimeout(time.Millisecond*500),
+		WithLeaderTimeout(electionPeriod),
+		WithUnaryGRPCTimeout(electionPeriod>>1), // default
+		WithLogCommandBatchSize(48),
 		WithChannelDepthToClientOffload(64),
 		WithMetrics(registry, testMetricNamespace, false))
 
@@ -400,11 +398,11 @@ func TestDetectBlockedBoltDB(t *testing.T) {
 	n := make([]*testNode, 2)
 
 	nodes := []string{":8188", ":8189", ":8190"}
-	n[0], err = testAddNodeWithDB(nodes, 0, "test/boltdb.0")
+	n[0], err = testAddNodeWithDB(nodes, 0, "test/boltdb.0", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n[1], err = testAddNodeWithDB(nodes, 1, "test/boltdb.0")
+	n[1], err = testAddNodeWithDB(nodes, 1, "test/boltdb.0", time.Second)
 	if err == nil {
 		t.Fatal("expected reused bbolt DB to force an error")
 	}
@@ -423,6 +421,9 @@ func TestDetectBlockedBoltDB(t *testing.T) {
 
 func TestElection(t *testing.T) {
 
+	electionPeriod := time.Millisecond * 400
+	wait := electionPeriod * 30
+	cycles := 5
 	nodeCount := 3
 	for i := 0; i < nodeCount; i++ {
 		os.Remove(fmt.Sprintf("test/boltdb.%d", i))
@@ -432,74 +433,99 @@ func TestElection(t *testing.T) {
 	nodes := []string{":8088", ":8089", ":8090"}
 	var err error
 
-	// Bring up the first node.
-	fmt.Println("Bring up 0")
-	n[0], err = testAddNode(nodes, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	for cycle := 0; cycle < cycles; cycle++ {
 
-	fmt.Println("Bring up 1")
-	n[1], err = testAddNode(nodes, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	findNewLeader := func() int {
-		var whoIsLeader int
-		for {
-			leader := 0
-			for i := 0; i < nodeCount; i++ {
-				if n[i] != nil {
-					results := testScrapeMetricsAndExtract(int32(i), "/metrics",
-						[]string{fmt.Sprintf("%s_raft_role", testMetricNamespace)})
-					if len(results) == 1 {
-						if results[0].val == "3" {
-							whoIsLeader = i
-							leader++
-						}
-					}
-				}
-			}
-			if leader == 1 {
-				break // we're done; we converged to 1 node
-			}
-			time.Sleep(time.Second)
+		// Bring up the first node.
+		fmt.Println(" ***************  CYCLE START: Bring up 0")
+		n[0], err = testAddNode(nodes, 0, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		fmt.Println("LEADER: ", whoIsLeader)
-		return whoIsLeader
-	}
-
-	whoIsLeader := findNewLeader()
-
-	//
-	// Bring up new node...
-	fmt.Println("Bring up 2")
-	n[2], err = testAddNode(nodes, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fmt.Println("Kill the current leader")
-	n[whoIsLeader].cancel()
-	n[whoIsLeader].cancel = nil
-
-	whoIsLeader = findNewLeader()
-	fmt.Println("Elected new leader")
-
-	for i := 0; i < nodeCount; i++ {
-		if n[i] == nil {
-			continue
+		fmt.Println(" ***************  Bring up 1")
+		n[1], err = testAddNode(nodes, 1, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if n[i].cancel != nil {
-			fmt.Println("Cancelling: ", i)
+
+		whoIsLeader := testFindNewLeader(n, wait, true)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		//
+		// Bring up new node...
+		fmt.Println(" ***************  Bring up 2")
+		n[2], err = testAddNode(nodes, 2, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		whoIsLeader = testFindNewLeader(n, wait, false)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		fmt.Println(" ***************  Kill the current leader", whoIsLeader)
+		n[whoIsLeader].cancel()
+		n[whoIsLeader].cancel = nil
+		n[whoIsLeader].wg.Wait()
+
+		inNeedOfResucitation := whoIsLeader
+		whoIsLeader = testFindNewLeader(n, wait, true)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		fmt.Println(" ***************  Bring up ", inNeedOfResucitation)
+		n[inNeedOfResucitation], err = testAddNode(nodes, inNeedOfResucitation, electionPeriod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		whoIsLeader = testFindNewLeader(n, wait, false)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		// Take two nodes out...
+		takeDown := []int{whoIsLeader, whoIsLeader + 1}
+		if takeDown[1] >= len(n) {
+			takeDown[1] = 0
+		}
+
+		fmt.Println(" ***************  Kill majority including leader", takeDown)
+		for i := range takeDown {
 			n[i].cancel()
+			n[i].cancel = nil
 		}
-		fmt.Println("Waiting for: ", i)
-		n[i].wg.Wait()
-	}
 
+		fmt.Println(" ***************  Restart killed nodes", takeDown)
+		for i := range takeDown {
+			n[i].wg.Wait() // wait for previous instance to finish coming down..., before we restart it.
+			n[i], err = testAddNode(nodes, i, electionPeriod)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		whoIsLeader = testFindNewLeader(n, wait, false)
+		if whoIsLeader == noLeader {
+			t.Fatal("expected leader but did not get one")
+		}
+
+		for i := 0; i < nodeCount; i++ {
+			if n[i] == nil {
+				continue
+			}
+			if n[i].cancel != nil {
+				fmt.Println("Cancelling: ", i)
+				n[i].cancel()
+			}
+			fmt.Println("Waiting for: ", i)
+			n[i].wg.Wait()
+		}
+	}
 }
 
 // ExampleMakeNode provides a simple example of how we kick off the Raft package,
@@ -585,6 +611,7 @@ func ExampleMakeNode_withCustomisedLogLevel() {
 		WithLeaderTimeout(time.Second))
 	if err != nil {
 		/// handle error
+		return
 	}
 
 	//
@@ -670,6 +697,7 @@ func ExampleMakeNode_withTLSConfiguration() {
 		WithLogger(l, true))
 	if err != nil {
 		// handle err
+		return
 	}
 
 	fmt.Printf("node started with config [%v]", n.config)
@@ -938,6 +966,101 @@ func testScrapeMetricsAndExtract(index int32, path string, metrics []string) []*
 	return result
 }
 
+func testScrapeOneMetricAndExtract(index int32, path string, metric string) *scrapedMetric {
+
+	out := testScrapeMetrics(index, path)
+	lines := strings.Split(out, "\n")
+
+	for _, line := range lines {
+		loc := testImmutableMetricsRegexp.FindSubmatch([]byte(line))
+		if len(loc) == 4 {
+			// fmt.Println(string(loc[0]))
+			// (full match) metricName, labels, value
+			if string(loc[1]) == metric {
+				return &scrapedMetric{
+					name:   string(loc[1]),
+					val:    string(loc[3]),
+					labels: string(loc[2]),
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func testFindNewLeader(n []*testNode, duration time.Duration, majorityEnough bool) int {
+	var whoIsLeader int
+
+	done := make(chan struct{})
+	go func() {
+		<-time.After(duration)
+		close(done)
+	}()
+	bail := func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+
+		}
+		return false
+	}
+
+	for {
+		leader := 0
+		for i := 0; i < len(n); i++ {
+			if n[i] != nil {
+				results := testScrapeMetricsAndExtract(int32(i), "/metrics",
+					[]string{fmt.Sprintf("%s_raft_role", testMetricNamespace)})
+				if len(results) == 1 {
+					if results[0].val == "3" {
+						whoIsLeader = i
+						leader++
+					}
+				}
+			}
+		}
+		if leader != 1 {
+			time.Sleep(time.Second)
+			if bail() {
+				return noLeader
+			}
+			continue
+		}
+
+		//
+		// Now that we think we have a leader, let's see if the majority concur
+		leaderFollowers := 0
+		for i := 0; i < len(n); i++ {
+			if n[i] != nil {
+				result := testScrapeOneMetricAndExtract(int32(i), "/metrics",
+					fmt.Sprintf("%s_raft_leader", testMetricNamespace))
+				if result != nil {
+					if result.val == fmt.Sprintf("%d", whoIsLeader) {
+						leaderFollowers++
+					}
+				}
+			}
+		}
+		targetFollowers := len(n) - 1 // > test implies we have to have all of them.
+		if majorityEnough {
+			targetFollowers = len(n) >> 1
+		}
+		if leaderFollowers > targetFollowers {
+			break // we're done; we converged to 1 node
+		}
+		time.Sleep(time.Second)
+		if bail() {
+			fmt.Println("Test LEADER NOT FOUND")
+			return noLeader
+		}
+	}
+
+	fmt.Println("Test found LEADER: ", whoIsLeader)
+	return whoIsLeader
+}
+
 func testSetupMetricsRegistryAndServer(index int32, path string) (*prometheus.Registry, *http.Server) {
 
 	endpoint := fmt.Sprintf("localhost:%v", testMetricsBasePort+index)
@@ -954,8 +1077,14 @@ func testSetupMetricsRegistryAndServer(index int32, path string) (*prometheus.Re
 	}
 
 	go func() {
-		err := metricServer.ListenAndServe()
-		if err != nil && err != http.ErrServerClosed {
+		err := backoff.Retry(func() error {
+			err := metricServer.ListenAndServe()
+			if err != nil && err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		}, backoff.WithMaxRetries(backoff.NewConstantBackOff(time.Millisecond*5000), 3))
+		if err != nil {
 			panic(err)
 		}
 	}()
@@ -967,7 +1096,7 @@ func testLoggerGet() *zap.Logger {
 
 	loggerCfg := DefaultZapLoggerConfig()
 	loggerCfg.Encoding = "console"
-	loggerCfg.Level.SetLevel(zapcore.InfoLevel)
+	loggerCfg.Level.SetLevel(zapcore.DebugLevel)
 	logger, _ := loggerCfg.Build()
 
 	return logger

@@ -7,15 +7,12 @@ import (
 
 // metricHolder holds metrics from the nodes perspective.
 //
-// Aim to track;
-// - errors
-// - utilisation
-// - saturation
+// Currently exporting raft state information; term, committedIndex, lastApplied, who is leader, role etc.
+// TODO: Aim to track errors, utilisation and saturation (http://www.brendangregg.com/usemethod.html)
 //
-// http://www.brendangregg.com/usemethod.html
-//
-// Centralising the metrics: the key advantage of having the metrics for the package in one place is that it becomes
-// easier to present a consistent set of metrics. Consistent metrics make for better operations and debugging.
+// Centralising the metrics code: the key advantage of having the metrics for the package in one place is that
+// it becomes easier to present a consistent set of metrics. Consistent metrics make for better operations and
+// debugging.
 //
 type metricsHolder struct {
 	registry *prometheus.Registry
@@ -25,8 +22,11 @@ type metricsHolder struct {
 	// Metrics
 	// A slightly unorthodox use of metrics in some cases; we export state as metrics too (e.g. current role
 	// of node, which node the current node thinks is the leader etc).
-	stateGauge prometheus.Gauge
-	leader     prometheus.Gauge
+	stateGauge     prometheus.Gauge
+	leader         prometheus.Gauge
+	term           prometheus.Gauge
+	committedIndex prometheus.Gauge
+	lastApplied    prometheus.Gauge
 }
 
 // Set up a metricsHolder to collect metrics for a given node.
@@ -66,9 +66,36 @@ func initMetrics(registry *prometheus.Registry, namespace string, detailed bool,
 		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
 	})
 
+	mh.term = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   namespace,
+		Subsystem:   "raft",
+		Name:        "term",
+		Help:        "current term from the perspective of this node.",
+		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
+	})
+
+	mh.committedIndex = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   namespace,
+		Subsystem:   "raft",
+		Name:        "committedIndex",
+		Help:        "current committedIndex from the perspective of this node.",
+		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
+	})
+
+	mh.lastApplied = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   namespace,
+		Subsystem:   "raft",
+		Name:        "lastApplied",
+		Help:        "current lastApplied from the perspective of this node.",
+		ConstLabels: map[string]string{"nodeIndex": fmt.Sprint(nodeIndex)},
+	})
+
 	registry.MustRegister(
 		mh.stateGauge,
-		mh.leader)
+		mh.leader,
+		mh.term,
+		mh.committedIndex,
+		mh.lastApplied)
 
 	return mh
 }

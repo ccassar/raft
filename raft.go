@@ -95,17 +95,13 @@ func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 			localNodeIndex, len(cfg.Nodes))
 	}
 
-	// Default to insecure dial options (i.e. no underlying TLS)
-	cfg.clientDialOptionsFn = func(l, r string) []grpc.DialOption {
-		return []grpc.DialOption{grpc.WithInsecure()}
-	}
-
 	if cfg.timers.leaderTimeout == 0 {
 		cfg.timers.leaderTimeout = time.Duration(2 * time.Second)
 	}
 
 	if cfg.timers.gRPCTimeout == 0 {
-		cfg.timers.gRPCTimeout = time.Duration(5 * time.Second)
+		// No use waiting for much longer than this. Timeouts will be firing all over the place soon enough.
+		cfg.timers.gRPCTimeout = cfg.timers.leaderTimeout >> 1
 	}
 
 	if cfg.channelDepth.clientEvents == 0 {
@@ -118,6 +114,14 @@ func (cfg *NodeConfig) validate(localNodeIndex int32) error {
 
 	if cfg.logCmdBatchSize == 0 {
 		cfg.logCmdBatchSize = 32
+	}
+
+	// Default to insecure dial options (i.e. no underlying TLS), with reasonable dial backoff and timeout options.
+	cfg.clientDialOptionsFn = func(l, r string) []grpc.DialOption {
+		return []grpc.DialOption{
+			grpc.WithInsecure(),
+			grpc.WithBackoffMaxDelay(cfg.timers.leaderTimeout >> 2), // default to connect 4x times within a timeout period
+		}
 	}
 
 	if cfg.LogDB == "" {
@@ -151,6 +155,8 @@ type Node struct {
 	metrics *metricsHolder
 	// logger for Node, configurable through WithLogger, or WithPreConfiguredLogger options.
 	logger *zap.SugaredLogger
+	// Very low level debugging.
+	verboseLogging bool
 }
 
 // FatalErrorChannel returns an error channel which is used by the raft Node to signal an unrecoverable failure
@@ -225,16 +231,17 @@ type NodeOption func(*Node) error
 // the appropriate node option. An example of exactly this use case is available in the godoc examples. In the example,
 // the logger configuration is set up to allow for on-the-fly changes to logging level.
 //
-// grpcLogs controls whether raft package redirects underlying gprc middleware logging to zap log. This is noisy, and
-// unless in depth gRPC troubleshooting is required, grpcLogToZap should be set to false.
-func WithLogger(logger *zap.Logger, grpcLogToZap bool) NodeOption {
+// verboseLogging controls whether raft package redirects underlying gprc middleware logging to zap log and includes
+// ultra low level debugging messages including keepalives. This makes debug very noisy, and unless in depth low level
+// message troubleshooting is required, verboseLogging should be set to false.
+func WithLogger(logger *zap.Logger, verboseLogging bool) NodeOption {
 	return func(n *Node) error {
 		if logger != nil {
 			n.logger = logger.Sugar()
 		} else {
 			n.logger = zap.NewNop().Sugar()
 		}
-		n.messaging.grpcLogging = grpcLogToZap
+		n.verboseLogging = verboseLogging
 
 		return nil
 	}
@@ -468,7 +475,7 @@ func MakeNode(
 
 		// flush the logger to make sure we get all the logs
 		n.logger.Info("raft package, goodbye")
-		n.logger.Sync()
+		_ = n.logger.Sync()
 		wg.Done()
 	}()
 

@@ -20,7 +20,10 @@ func (n *Node) LogProduce(ctx context.Context, data []byte) error {
 	returnChan := make(chan *logCommandContainer, 1)
 
 	container := &logCommandContainer{
-		request:    &raft_pb.LogCommandRequest{},
+		request: &raft_pb.LogCommandRequest{
+			Command: data,
+			Origin:  n.index,
+		},
 		returnChan: returnChan,
 		appCtx:     ctx,
 	}

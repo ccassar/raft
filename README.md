@@ -81,12 +81,38 @@ and server (`grpc.ServerOptions`) options can be provided by the application as 
 Godoc provides [an example](https://godoc.org/github.com/ccassar/raft#example-MakeNode--WithTLSConfiguration) of how to
 run with TLS enabled and with mutual authentication between server and client.
 
+### Test Application
+
+The source in [`app`](app/README.md) application is a simple skeleton demonstration showing simple features of the raft
+package in action. Test Application instances running in a cluster will all see a single version of a distributed log
+and each contribute random log commands to that log. Each command is made up of an originating node and a UUID.
+
+Sample output from an instance in the application cluster would look like this:
+
+```
+Node0:29463c76-159a-43bd-8aa0-c0c654e67f69
+Node0:832a806b-2cab-47d5-9a79-2a075f56324e
+Node1:54caaacb-b585-4b01-8db4-9c3739d1c4ba
+Node2:2740efcb-df3f-4c04-b3d0-b1c7ed163bc3
+Node0:d6adc157-27c3-45de-9c91-f4d83ea2d19f
+Node1:00bdafa3-30d4-4be8-bb06-3472927ad00a
+Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
+```
+
+A Dockerfile is provided, together with a helm chart to enable deployment of the application cluster as a kubernetes
+deployment. 
+
+
 ### Metrics
 
 The Raft package accepts a prometheus metrics registry and uses that to track key statistics of the Raft
 operation, including RPC metrics client and server side (using gRPC middleware interceptors). The WithMetrics can be
 called without a registry in which case metrics are collected against the default registry. If WithMetrics option is
 not setup, no metrics are collected.
+
+ A Grafana dashboards is provided for the raft package. The kubernetes/helm based deployment of the example application
+ provides a live view of the Grafana raft dashboard.
+
 
 ### Logging
 
@@ -165,17 +191,20 @@ programmatically. In essence:
 
 Lots to go, but do come inside and have a look.
 
-Done so far:
+Completed so far:
 
  - General package infra: gRPC client and server setup, logging, metrics, UT
  - Leadership election
  - Log replication
+ - basic metrics export
 
 Todo next:
 
- - election: only basic testing so far; extend scenarios covered
- - replication: basic and extended testing
+ - election: performance and negative testing; more functional testing around recovery
  - graceful handover on leader before shutdown
+ - refactor TestLogReplication()
+ - errors/utilisation/saturation metrics
+ - deploy with helm chart and prometheus grafana dashboard on gke
 
 Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
 guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
@@ -209,35 +238,38 @@ trying to push to raftEngine.
 The life-of-a-packet for various paths through the system...
 
 ##### Application learns about newly committed log command from raft package:
-    Trigger: load a new commitIndex. This could happen when we learn of new commit index as followers from a leader,
-    or as a leader when an acknowledgement for an AppendEntry update is received.
-    Action: the local publisher is notified (assuming a notification is not pending already). The local publisher
-    strives to keep the local application in sync with committed log commands.
+
+Trigger: load a new commitIndex. This could happen when we learn of new commit index as followers from a leader,
+or as a leader when an acknowledgement for an AppendEntry update is received.
+Action: the local publisher is notified (assuming a notification is not pending already). The local publisher
+strives to keep the local application in sync with committed log commands.
 
 ##### Application pushes new log command on follower node:
-    Trigger: application pushes log command to log producer via LogProduce(). Log producer hands off logCommandContainer
-    to raftEngine and blocks waiting for response on response channel. This means we will only have one cmd log in flight
-    at any one point if the client serialises calls to LogProduce. (Eventually we may publish results asynchronously to
-    improve performance.) 
-    Action: raftEngine hands the logCommandContainer to the client for the leader on the logCommand channel as a
-    logCmdEvent . The log command is propagated to the leader over gRPC and handled there. The entries are added to the
-    log. And ack tracker is setup to watch for when the committedIndex moves to this index. When that happens the tracker
-    will acknowledge which will release the response to the remote node. When the result is received at the originating
-    node for the producing application, it is passed back to the log producer and the application through the return
-    channel in the logCommandContainer. In the case where the log command was sourced locally to the leader, then the
-    acker will feed the acknowledgement directly to the logProducer and the application.
+
+Trigger: application pushes log command to log producer via LogProduce(). Log producer hands off logCommandContainer
+to raftEngine and blocks waiting for response on response channel. This means we will only have one cmd log in flight
+at any one point if the client serialises calls to LogProduce. (Eventually we may publish results asynchronously to
+improve performance.) 
+Action: raftEngine hands the logCommandContainer to the client for the leader on the logCommand channel as a
+logCmdEvent . The log command is propagated to the leader over gRPC and handled there. The entries are added to the
+log. And ack tracker is setup to watch for when the committedIndex moves to this index. When that happens the tracker
+will acknowledge which will release the response to the remote node. When the result is received at the originating
+node for the producing application, it is passed back to the log producer and the application through the return
+channel in the logCommandContainer. In the case where the log command was sourced locally to the leader, then the
+acker will feed the acknowledgement directly to the logProducer and the application.
 
 ##### raftEngine receives a new log command on leader node:
-    Trigger: remote (or local) logCommand message with new log command.
-    Action: raftEngine installs the new log command in the log, and notifies clients (if no notification is pending)
-    one by one. Clients will pull and doggedly attempt to get the missing log commands to the remote nodes. raftEngine
-    leader tracks client matchIndex and nextIndex. Any rejections received for AppendEntry messages reset the next
-    index. When a node becomes a leader it assumes that followers are in sync by setting the nextIndex to one ahead of
-    index of last entry in log on leader. The keepalive includes the latest prevLogIndex and prevLogTerm. Followers
-    which are not in sync, will nak the keepalive resulting in their nextIndex being rolled back to hunt for common
-    point in log between leader and follower.
+
+Trigger: remote (or local) logCommand message with new log command.
+Action: raftEngine installs the new log command in the log, and notifies clients (if no notification is pending)
+one by one. Clients will pull and doggedly attempt to get the missing log commands to the remote nodes. raftEngine
+leader tracks client matchIndex and nextIndex. Any rejections received for AppendEntry messages reset the next
+index. When a node becomes a leader it assumes that followers are in sync by setting the nextIndex to one ahead of
+index of last entry in log on leader. The keepalive includes the latest prevLogIndex and prevLogTerm. Followers
+which are not in sync, will nak the keepalive resulting in their nextIndex being rolled back to hunt for common
+point in log between leader and follower.
     
-     
+         
 #### Unrecoverable Errors
 
 When the raft packages encounters failures which are unrecoverable; e.g. persisted content it can not unmarshal, or
