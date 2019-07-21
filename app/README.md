@@ -41,9 +41,9 @@ docker build -t raftapp:<tag> .
 
 If access to a kubernetes cluster is available, you can use the [helm chart provided](helm/raftapp) to deploy an application
 cluster quickly and with little effort. If the prometheus operator is setup, you can monitor the test application
-cluster using the dashboard provided. The simplest way of seeing the test application in action, is to run an application
-cluster in the cloud; for example on Google Kubernetes Engine (GKE), especially if you already have access to a
-kubernetes cluster with helm deployed.
+cluster using the [dashboard provided](helm/raftapp/resources/dashboards/). The simplest way of seeing the test
+application in action, is to run an application cluster in the cloud; for example on Google Kubernetes Engine (GKE),
+especially if you already have access to a kubernetes cluster with helm deployed.
 
 Note:  The helm chart provided is simplistic and runs deployments. It is not a good example of how to deploy an application
 (e.g a single helm chart install of a StatefulSet would probably be more appropriate than the rough and ready 3x single

@@ -18,10 +18,12 @@ The best (and only) place to start if you are planning to embed this package in 
 [package documentation here](https://godoc.org/github.com/ccassar/raft).
 
 Extensive examples are included, including how to setup TLS with mutual authentication to protect gRPC intra-cluster
-communication. The rest of this README.md is largely about the implementation of the package itself. A helm chart is
-also provided to facilitate deploying a demonstration application cluster on Kubernetes (e.g. on Google Kubernetes Engine in
-Google Cloud). This demo application includes metric export and grafana dashboard and can be deployed using a single
-`helm install` invocation.
+communication. The rest of this README.md is largely about the implementation of the package itself.
+
+A [helm chart is also provided](https://github.com/ccassar/raft/blob/logreplication/app/README.md#helm-deployment-of-application-cluster-to-kubernetes)
+to facilitate deploying a demonstration application cluster on Kubernetes (e.g. on Google Kubernetes Engine in Google
+Cloud). This demo application includes metric export and [grafana dashboard](app/helm/raftapp/resources/dashboards/)
+and can be deployed using a single `helm install` invocation.
 
 The focus of this implementation is an all-batteries-included, production quality, extensively tested, complete
 implementation of the core Raft specification. The list of Raft enhancements which are still pending is as follows:
@@ -191,6 +193,8 @@ exactly-once guarantees to clients and, beyond Raft, to bring Byzantine fault to
  - graceful handover on leader before shutdown
  - refactor TestLogReplication()
  - errors/utilisation/saturation metrics
+ - add dashboard to cover gRPC metrics, and add configmap to deploy dashboard automatically using the approach described
+   [here](https://github.com/helm/charts/tree/master/stable/grafana#sidecar-for-dashboards).
  - docker compose based example for those running locally
  - add config exchange as part of voting protocol to protect/detect misconfiguration (duplicate node ids, sufficiently
    mismatched pre-jittered election timeouts etc)
