@@ -333,16 +333,6 @@ func (re *raftEngine) initLogDB(ctx context.Context, n *Node) error {
 		return err
 	}
 
-	// We start by purging any preexisting log entries if they exist. Eventually we will use the persisted
-	// log for initial checkpoint, but not yet.
-	err = ldb.Update(func(tx *bolt.Tx) error {
-		err = tx.DeleteBucket([]byte(dbBucketLog))
-		if err != nil && err != bolt.ErrBucketNotFound {
-			return err
-		}
-		return nil
-	})
-
 	err = ldb.Update(func(tx *bolt.Tx) error {
 		_, err = tx.CreateBucketIfNotExists([]byte(dbBucketLog))
 		return err
