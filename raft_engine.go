@@ -190,8 +190,19 @@ func (l *raftEngineLeader) maintainCommittedIndexForLeader() {
 
 	// committed index can be no better than the last acknowledged log entry of the middle remote node. We know
 	// more than the majority have acknowledged that value.
-	if l.engine.updateCommittedIndexIfNecessary(oc[nodeToCheck]) {
+	indexKnownToMajority := oc[nodeToCheck]
+	//
+	// Find term for index we are about to try and commit. If it is for this term, then we can go ahead and commit
+	// it, otherwise we must wait to commit until the first index in this term is committable. Section 5.4.2 of
+	// ISUCA.
+	//
+	le, err := l.engine.logGetEntry(indexKnownToMajority)
+	if err != nil || le == nil {
+		return // error will cause shutdown, le == nil means we, as leaders, do not have so we will definitely not commit.
+	}
 
+	if l.engine.currentTerm.Load() == le.Term &&
+		l.engine.updateCommittedIndexIfNecessary(indexKnownToMajority) {
 		//
 		// Wake up acker if necessary. Acker will be scheduled to run and validate whether any pending acks need to be
 		// issued to local terminated or remote applications.
