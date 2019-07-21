@@ -31,36 +31,27 @@ Unit test coverage is high and it is a goal to keep it so; unit test code itself
 implementation.
 
 
-### Raft, The Consensus Algorithm
+### Test Application
 
-Key references for the implementation are:
+The source in [`app`](app/README.md) application is a simple skeleton demonstration showing simple features of the raft
+package in action. Test Application instances running in a cluster will all see a single version of a distributed log
+and each contribute random log commands to that log. Each command is made up of an originating node and a UUID.
 
-0. Diego Ongaro and John Ousterhout, [In Search of an Understandable Consensus Algorithm. 2014](https://www.usenix.org/conference/atc14/technical-sessions/presentation/ongaro) (ISUCA)
+Sample output from an instance in the application cluster would look like this:
 
-1. Diego Ongaro. Consensus: [Bridging Theory and Practice. Stanford University Ph.D. Dissertation. Aug. 2014.](https://ongardie.net/var/blurbs/pubs/dissertation.pdf) (CBTP)
+```
+Node0:29463c76-159a-43bd-8aa0-c0c654e67f69
+Node0:832a806b-2cab-47d5-9a79-2a075f56324e
+Node1:54caaacb-b585-4b01-8db4-9c3739d1c4ba
+Node2:2740efcb-df3f-4c04-b3d0-b1c7ed163bc3
+Node0:d6adc157-27c3-45de-9c91-f4d83ea2d19f
+Node1:00bdafa3-30d4-4be8-bb06-3472927ad00a
+Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
+```
 
-2. Heidi Howard. [ARC: analysis of Raft consensus. University of Cambridge, Computer Laboratory, Jul. 2014.](https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-857.pdf) (ARC)
-
-Reference to the above in code uses acronyms included above (i.e. CBTP, ARC, ISUCA).
-
-For an excellent short presentation about Raft, see: https://www.usenix.org/node/184041
-
-Key assertions:
-
-- a raft node can be in one of three roles: Follower, Candidate and Leader.
-- log entries only ever flow from leader to followers.
-- a term will only ever have one leader.
-- followers never accept log entries from leaders on smaller term.
-- leaders never remove entries, and followers only remove entries which conflict with leader (and are by definition uncommitted).
-- voters only vote for leader if leader is as up-to-date as voter at least.
-
-Raft is not Byzantine fault tolerant. A Raft variant called [Tangaroa](http://www.scs.stanford.edu/14au-cs244b/labs/projects/copeland_zhong.pdf) proposes extensions
-to make it so.
-
-Core Raft provides clients with at-least-once guarantees (Section 6.3 CBTP). This is because a leader may
-fail once a proposal has been committed but before an acknowledgment is sent to the client. The same section
-proposes a method to support exactly-once guarantees for a proposal even in the context of concurrent writes
-from the same session.
+A simple multistage Dockerfile [is provided](app/docker/Dockerfile), together with a helm chart to enable deployment of
+the application cluster as a kubernetes deployment are provided. Instructions are also included for application cluster
+deployment in a cloud environment (specifically on Google Kubernetes Engine).
 
 
 ### Intracluster Messaging
@@ -80,27 +71,6 @@ The Raft package supports protecting intra-cluster traffic with mutually authent
 and server (`grpc.ServerOptions`) options can be provided by the application as part of `MakeNode()` initialisation.
 Godoc provides [an example](https://godoc.org/github.com/ccassar/raft#example-MakeNode--WithTLSConfiguration) of how to
 run with TLS enabled and with mutual authentication between server and client.
-
-### Test Application
-
-The source in [`app`](app/README.md) application is a simple skeleton demonstration showing simple features of the raft
-package in action. Test Application instances running in a cluster will all see a single version of a distributed log
-and each contribute random log commands to that log. Each command is made up of an originating node and a UUID.
-
-Sample output from an instance in the application cluster would look like this:
-
-```
-Node0:29463c76-159a-43bd-8aa0-c0c654e67f69
-Node0:832a806b-2cab-47d5-9a79-2a075f56324e
-Node1:54caaacb-b585-4b01-8db4-9c3739d1c4ba
-Node2:2740efcb-df3f-4c04-b3d0-b1c7ed163bc3
-Node0:d6adc157-27c3-45de-9c91-f4d83ea2d19f
-Node1:00bdafa3-30d4-4be8-bb06-3472927ad00a
-Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
-```
-
-A Dockerfile is provided, together with a helm chart to enable deployment of the application cluster as a kubernetes
-deployment. 
 
 
 ### Metrics
@@ -200,11 +170,22 @@ Completed so far:
 
 Todo next:
 
+ - prometheus scraping service monitor
+ - dashboard, and dump some images
+ - doc
+ - maybe persistent volume(?)
+
  - election: performance and negative testing; more functional testing around recovery
  - graceful handover on leader before shutdown
  - refactor TestLogReplication()
  - errors/utilisation/saturation metrics
- - deploy with helm chart and prometheus grafana dashboard on gke
+ - deploy with helm chart and prometheus grafana dashboard on gke, and docker compose based example for those running
+   locally
+ - add config exchange as part of voting protocol to protect/detect misconfiguration (duplicate node ids, sufficiently
+   mismatched pre-jittered election timeouts etc)
+ - set up an anti-affinity example in the helm deployment as an example of how to avoid application cluster nodes
+   being serviced by the same underlying kubernetes node
+
 
 Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
 guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
@@ -215,6 +196,38 @@ guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via T
 Other than the usual dependencies (i.e. go installation), protoc needs to be installed as [described here](https://github.com/golang/protobuf) 
 and the directory hosting protoc should be in the PATH. Running `go generate` will automatically regenerate 
 generated source.
+
+
+### Raft, The Consensus Algorithm
+
+Key references for the implementation are:
+
+0. Diego Ongaro and John Ousterhout, [In Search of an Understandable Consensus Algorithm. 2014](https://www.usenix.org/conference/atc14/technical-sessions/presentation/ongaro) (ISUCA)
+
+1. Diego Ongaro. Consensus: [Bridging Theory and Practice. Stanford University Ph.D. Dissertation. Aug. 2014.](https://ongardie.net/var/blurbs/pubs/dissertation.pdf) (CBTP)
+
+2. Heidi Howard. [ARC: analysis of Raft consensus. University of Cambridge, Computer Laboratory, Jul. 2014.](https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-857.pdf) (ARC)
+
+Reference to the above in code uses acronyms included above (i.e. CBTP, ARC, ISUCA).
+
+For an excellent short presentation about Raft, see: https://www.usenix.org/node/184041
+
+Key assertions:
+
+- a raft node can be in one of three roles: Follower, Candidate and Leader.
+- log entries only ever flow from leader to followers.
+- a term will only ever have one leader.
+- followers never accept log entries from leaders on smaller term.
+- leaders never remove entries, and followers only remove entries which conflict with leader (and are by definition uncommitted).
+- voters only vote for leader if leader is as up-to-date as voter at least.
+
+Raft is not Byzantine fault tolerant. A Raft variant called [Tangaroa](http://www.scs.stanford.edu/14au-cs244b/labs/projects/copeland_zhong.pdf) proposes extensions
+to make it so.
+
+Core Raft provides clients with at-least-once guarantees (Section 6.3 CBTP). This is because a leader may
+fail once a proposal has been committed but before an acknowledgment is sent to the client. The same section
+proposes a method to support exactly-once guarantees for a proposal even in the context of concurrent writes
+from the same session.
 
 
 ### Implementation Notes

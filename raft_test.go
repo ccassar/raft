@@ -29,6 +29,9 @@ import (
 const testMetricsBasePort = 9001
 const testMetricNamespace = "raftTest"
 
+// Readonly node ports...
+var constNodes = []string{":8088", ":8089", ":8090"}
+
 func TestMakeNode(t *testing.T) {
 
 	// A neat property of the package is that it hunts for a node it can become - if cluster is made of of three
@@ -37,14 +40,14 @@ func TestMakeNode(t *testing.T) {
 	// for Nodes can be passed in to all nodes; e.g. these three local instances fired up will between them settle
 	// in the role of one of the configured nodes.
 	nodeCfgs := []NodeConfig{{
-		Nodes:   []string{":8088", ":8089", ":8090"},
-		LogDB:   "test/boltdb.8088",
+		Nodes:   constNodes,
+		LogDB:   "test/boltdb.a",
 		LogCmds: make(chan []byte)}, {
-		Nodes:   []string{":8088", ":8089", ":8090"},
-		LogDB:   "test/boltdb.8089",
+		Nodes:   constNodes,
+		LogDB:   "test/boltdb.b",
 		LogCmds: make(chan []byte)}, {
-		Nodes:   []string{":8088", ":8089", ":8090"},
-		LogDB:   "test/boltdb.8090",
+		Nodes:   constNodes,
+		LogDB:   "test/boltdb.c",
 		LogCmds: make(chan []byte)},
 	}
 
@@ -72,7 +75,7 @@ func TestMakeNode(t *testing.T) {
 		{
 			"NEGATIVE Node Config Missing LogDB",
 			[]NodeConfig{{
-				Nodes:   []string{":8088", ":8089", ":8090"},
+				Nodes:   constNodes,
 				LogCmds: make(chan []byte)}},
 			[]NodeOption{},
 			false,
@@ -81,7 +84,7 @@ func TestMakeNode(t *testing.T) {
 		{
 			"NEGATIVE Node Config Missing LogCmds channel",
 			[]NodeConfig{{
-				Nodes: []string{":8088", ":8089", ":8090"},
+				Nodes: constNodes,
 				LogDB: "mydb"}},
 			[]NodeOption{},
 			false,
@@ -397,17 +400,18 @@ func TestDetectBlockedBoltDB(t *testing.T) {
 	var err error
 	n := make([]*testNode, 2)
 
+	db := "test/boltdbNEG.0"
 	nodes := []string{":8188", ":8189", ":8190"}
-	n[0], err = testAddNodeWithDB(nodes, 0, "test/boltdb.0", time.Second)
+	n[0], err = testAddNodeWithDB(nodes, 0, db, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n[1], err = testAddNodeWithDB(nodes, 1, "test/boltdb.0", time.Second)
+	n[1], err = testAddNodeWithDB(nodes, 1, db, time.Second)
 	if err == nil {
 		t.Fatal("expected reused bbolt DB to force an error")
 	}
 
-	if errors.Cause(err) != RaftErrorLockedBoltDB {
+	if errors.Cause(err).Error() != "timeout" {
 		t.Fatal("expected reused bbolt DB to force an error, but error returned is not expected one", err)
 	}
 
@@ -430,7 +434,7 @@ func TestElection(t *testing.T) {
 	}
 
 	n := make([]*testNode, nodeCount)
-	nodes := []string{":8088", ":8089", ":8090"}
+	nodes := constNodes
 	var err error
 
 	for cycle := 0; cycle < cycles; cycle++ {

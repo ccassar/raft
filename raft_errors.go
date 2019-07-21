@@ -52,10 +52,6 @@ const RaftErrorBadLocalNodeIndex = Error(raftSentinel + "bad localNodeIndex opti
 // extract and test against sentinel.
 const RaftErrorServerNotSetup = Error(raftSentinel + "local server side not set up yet")
 
-// RaftErrorLockedBoltDB is the sentinel returned  (extracted using errors.Cause(err)) if
-// boltDB is locked by other process at startup.
-const RaftErrorLockedBoltDB = Error(raftSentinel + "local server side not set up yet")
-
 // RaftErrorClientConnectionUnrecoverable is the sentinel returned  (extracted using errors.Cause(err)) if
 // client gRPC connection to remote node failed. See ExampleMakeNode for an example of how to extract and test against
 // sentinel.

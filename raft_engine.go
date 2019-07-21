@@ -415,7 +415,7 @@ func (re *raftEngine) replaceTermIfNewer(rxTerm int64) termComparisonResult {
 }
 
 // candidateStateFn implements the behaviour of the node while in candidate state. While in candidate state
-// we do not handle the localLogCommandChan - no leader to pass request too.
+// we do not handle the localLogCommandChan.
 func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 
 	defer func() {
@@ -576,6 +576,7 @@ func (re *raftEngine) candidateStateFn(ctx context.Context) stateFn {
 
 }
 
+// leaderStateFn describes the behaviour of the node while in leader state
 func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 
 	re.updateCurrentLeader(re.node.index)
@@ -767,61 +768,6 @@ func (re *raftEngine) leaderStateFn(ctx context.Context) stateFn {
 	}
 }
 
-// keepaliveGenerator is used as AfterFunc to schedule a keepalive for a given node.
-func keepaliveGenerator(ctx context.Context, index int32, trigger chan int32) func() {
-	return func() {
-		select {
-		case trigger <- index:
-		case <-ctx.Done():
-			// All timers are cancelled when leader state function exists.
-		}
-	}
-}
-
-// rafteEngine.handleLogCommandContainer is expected to only be called when we are leader.
-func (re *raftEngine) handleLogCommandContainer(ctx context.Context, msg *logCommandContainer) {
-
-	failed := func(msg *logCommandContainer, why string, err error) {
-		re.node.logger.Debugw(
-			"raftEngine leader, error handling log command from application",
-			append(re.logKV(), "remoteNodeIndex", msg.request.Origin)...)
-		msg.reply = &raft_pb.LogCommandReply{
-			Ack:    false,
-			Reason: why}
-		msg.returnChan <- msg // dedicated response channel will not block.
-	}
-
-	// We have received a new inbound command. We need to start by appending it to the log.
-	// Then we need to notify the gRPC clients for the remote nodes. The event passed is what
-	// effectively pulls up the AppendEntries required and pushes.
-	_, index, err := re.logGetLastTermAndIndex()
-	if err != nil {
-		failed(msg, "leader failed fetching index from persisted log, "+
-			"leader resigning, please retry", err)
-		return
-	}
-	index++
-	// Now that we have an index, and know our current term, let's add it to the log.
-	err = re.logAddEntry(&raft_pb.LogEntry{
-		Term:     re.currentTerm.Load(),
-		Sequence: index,
-		Data:     msg.request.Command})
-	if err != nil {
-		failed(msg, "leader failure adding persisted log, "+
-			"leader resigning, please retry", err)
-		return
-	}
-
-	// Next we need to track the pending ack with the acker. When the index gets committed, the ack
-	// will be dispatched.
-	re.leaderState.acker.trackPendingAck(msg, index)
-	// We need to potentially notify each client that they may need to wake up to resync.
-	// To do that we send the notify event which embodies the pulling and syncing necessary.
-	for _, client := range re.node.messaging.clients {
-		re.leaderState.notifyClientToProduceAppendEntries(ctx, client.index)
-	}
-}
-
 // followerStateFn describes the behaviour of the node while in follower state.
 func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 
@@ -878,7 +824,7 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 			case msg := <-re.inboundRequestVoteChan:
 
 				if re.handleRxedRequestVote(msg) {
-					// if we voted, it probably makes sense to extend our timeout
+					// if we voted, we extend our timeout
 					ltTimerStop()
 					re.node.logger.Debugw(
 						"raftEngine follower, cast vote in election",
@@ -940,6 +886,61 @@ func (re *raftEngine) followerStateFn(ctx context.Context) stateFn {
 				return nil
 			}
 		}
+	}
+}
+
+// keepaliveGenerator is used as AfterFunc to schedule a keepalive for a given node.
+func keepaliveGenerator(ctx context.Context, index int32, trigger chan int32) func() {
+	return func() {
+		select {
+		case trigger <- index:
+		case <-ctx.Done():
+			// All timers are cancelled when leader state function exists.
+		}
+	}
+}
+
+// rafteEngine.handleLogCommandContainer is expected to only be called when we are leader.
+func (re *raftEngine) handleLogCommandContainer(ctx context.Context, msg *logCommandContainer) {
+
+	failed := func(msg *logCommandContainer, why string, err error) {
+		re.node.logger.Debugw(
+			"raftEngine leader, error handling log command from application",
+			append(re.logKV(), "remoteNodeIndex", msg.request.Origin)...)
+		msg.reply = &raft_pb.LogCommandReply{
+			Ack:    false,
+			Reason: why}
+		msg.returnChan <- msg // dedicated response channel will not block.
+	}
+
+	// We have received a new inbound command. We need to start by appending it to the log.
+	// Then we need to notify the gRPC clients for the remote nodes. The event passed is what
+	// effectively pulls up the AppendEntries required and pushes.
+	_, index, err := re.logGetLastTermAndIndex()
+	if err != nil {
+		failed(msg, "leader failed fetching index from persisted log, "+
+			"leader resigning, please retry", err)
+		return
+	}
+	index++
+	// Now that we have an index, and know our current term, let's add it to the log.
+	err = re.logAddEntry(&raft_pb.LogEntry{
+		Term:     re.currentTerm.Load(),
+		Sequence: index,
+		Data:     msg.request.Command})
+	if err != nil {
+		failed(msg, "leader failure adding persisted log, "+
+			"leader resigning, please retry", err)
+		return
+	}
+
+	// Next we need to track the pending ack with the acker. When the index gets committed, the ack
+	// will be dispatched.
+	re.leaderState.acker.trackPendingAck(msg, index)
+	// We need to potentially notify each client that they may need to wake up to resync.
+	// To do that we send the notify event which embodies the pulling and syncing necessary.
+	for _, client := range re.node.messaging.clients {
+		re.leaderState.notifyClientToProduceAppendEntries(ctx, client.index)
 	}
 }
 

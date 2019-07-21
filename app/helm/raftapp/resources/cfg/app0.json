@@ -1,0 +1,11 @@
+{
+  "Nodes": [":{{ .Values.service.raft.containerPort }}","ra1-raftapp:{{ .Values.service.raft.port }}","ra2-raftapp:{{ .Values.service.raft.port }}"],
+  "LogDB": "/pdata/testlogdb",
+  "LeaderTimeout": "500ms",
+  "LogCmdPeriod": "10s",
+  "Metrics" : {
+    "Endpoint": ":{{ .Values.service.metrics.containerPort }}",
+    "Namespace": "raftapp",
+    "Path":"/metrics"
+  }
+}

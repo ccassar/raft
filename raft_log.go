@@ -304,44 +304,22 @@ func (re *raftEngine) initLogDB(ctx context.Context, n *Node) error {
 	f := n.config.LogDB
 
 	opts := *bolt.DefaultOptions
-	// Potential for overwriting options like fsync if persisted data does not matter.
+	// Time to block trying to achieve flock on DB. We do not expect contention here, so we
+	// provide and arbitrary small amount of time to avoid blocking indefinitely if a lock is
+	// held on the DB (like when we try and run multiple instances of the same node).
+	opts.Timeout = time.Second * 3
 
 	n.logger.Debugw("opening bolt DB for persistence", n.logKV()...)
 	var ldb *bolt.DB
 	var err error
 
-	done := make(chan struct{})
-	go func() {
-		ldb, err = bolt.Open(f, 0666, &opts)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second): // catch bboltdb blocking on some other user locking the DB
-		err = raftErrorf(RaftErrorLockedBoltDB,
-			"loading bbolt DB for log entries blocked (is another process using the DB?)")
-		n.logger.Errorw("initialising DB for log entries", append(n.logKV(), raftErrKeyword, err)...)
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
+	ldb, err = bolt.Open(f, 0666, &opts)
 	if err != nil {
-		err = raftErrorf(err, "loading bbolt DB for log entries failed")
+		err = raftErrorf(err,
+			"open bbolt DB for log entries failed (is another process using the DB?)")
 		n.logger.Errorw("initialising DB for log entries", append(n.logKV(), raftErrKeyword, err)...)
 		return err
 	}
-
-	// We start by purging any preexisting log entries if they exist. Eventually we will use the persisted
-	// log for initial checkpoint, but not yet.
-	err = ldb.Update(func(tx *bolt.Tx) error {
-		err = tx.DeleteBucket([]byte(dbBucketLog))
-		if err != nil && err != bolt.ErrBucketNotFound {
-			return err
-		}
-		return nil
-	})
 
 	err = ldb.Update(func(tx *bolt.Tx) error {
 		_, err = tx.CreateBucketIfNotExists([]byte(dbBucketLog))

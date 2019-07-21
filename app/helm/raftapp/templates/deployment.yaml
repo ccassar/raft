@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "raftapp.fullname" . }}
+  labels:
+{{ include "raftapp.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "raftapp.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "raftapp.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+    {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["/root/app", "-config=/data/app{{ required "missing mandatory option '--set nodeid=0,1 or 2'" .Values.nodeid }}.json", "-localNode={{ .Values.nodeid }}", "-zapEncoding=json"]
+          volumeMounts:
+          - name: data-volume
+            mountPath: /data
+          - name: persistent-data-volume
+            mountPath: /pdata
+          ports:
+            - name: raft
+              containerPort: {{ .Values.service.raft.containerPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.service.metrics.containerPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: persistent-data-volume
+          persistentVolumeClaim:
+            claimName: {{ include "raftapp.fullname" . }}
+        - name: data-volume
+          configMap:
+            name: {{ include "raftapp.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}

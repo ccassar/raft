@@ -216,7 +216,7 @@ func TestLogReplication(t *testing.T) {
 	}
 
 	n := make([]*testNode, nodeCount)
-	nodes := []string{":8088", ":8089", ":8090"}
+	nodes := constNodes
 	var err error
 
 	for i := 0; i < len(nodes); i++ {
@@ -274,9 +274,17 @@ func TestLogReplication(t *testing.T) {
 	}
 
 	// Destroy leader node and exercise resync...
-	fmt.Println("Destroying leader:", leaderIndex)
+	fmt.Println(" ***************  Destroying leader:", leaderIndex)
 	n[leaderIndex].cancel()
 	n[leaderIndex].wg.Wait()
+
+	// Produce an entry at the leader first and receive it, elsewhere.
+	newLeaderIndex := testFindNewLeader(n, wait, true)
+	if leaderIndex == noLeader {
+		t.Fatal("failed to elect a new leader")
+	}
+	fmt.Println(" ***************  New leader:", newLeaderIndex)
+
 	fmt.Println("Resuscitating old leader node:", leaderIndex)
 	n[leaderIndex], err = testAddNode(nodes, leaderIndex, electionPeriod)
 	for msgCount := 0; msgCount < messages*len(producers); msgCount++ {
@@ -308,7 +316,7 @@ func TestLogReplication(t *testing.T) {
 	fmt.Printf(" ***************  Produced %d msgs from %d: %s\n",
 		produced, producerIndex, string(msgContent))
 
-	fmt.Println("Resuscitating old follower (user to be leader) node:", leaderIndex)
+	fmt.Println("Resuscitating old follower (used to be leader) node:", leaderIndex)
 	n[leaderIndex], err = testAddNode(nodes, leaderIndex, electionPeriod)
 
 	for msgCount := 0; msgCount < messages*(len(producers)+1); msgCount++ {
