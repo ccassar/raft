@@ -32,7 +32,12 @@ Intra-cluster connectivity is implemented over gRPC with support for TLS protect
 
 Observability is central to a production-quality implementation; structured logging (using Uber zap library)
 and metrics export (using prometheus library and gRPC interceptors for both metrics and logging) are an integral
-part of the implementation.
+part of the implementation. The basic dashboard below is include in the helm chart and shows the state of each
+node in the application cluster; follower, candidate or leader role, who is leader (and how leadership changed)
+from the perspective of each node, what is the term, committed and applied index at each node.
+
+![Raft Package Overview](resources/raftOverviewDashboardL.png)
+
 
 Unit test coverage is high and it is a goal to keep it so; unit test code itself is a key component of the
 implementation.
@@ -182,8 +187,6 @@ Todo next:
 Target is to, eventually, cover all of Raft functionality including cluster membership extensions, log compaction,
 exactly-once guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
 
- - prometheus scraping service monitor
- - dashboard, and dump some images
  - election: performance and negative testing; more functional testing around recovery
  - graceful handover on leader before shutdown
  - refactor TestLogReplication()
