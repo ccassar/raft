@@ -28,6 +28,8 @@ spec:
           volumeMounts:
           - name: data-volume
             mountPath: /data
+          - name: persistent-data-volume
+            mountPath: /pdata
           ports:
             - name: raft
               containerPort: {{ .Values.service.raft.containerPort }}
@@ -46,6 +48,9 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        - name: persistent-data-volume
+          persistentVolumeClaim:
+            claimName: {{ include "raftapp.fullname" . }}
         - name: data-volume
           configMap:
             name: {{ include "raftapp.fullname" . }}

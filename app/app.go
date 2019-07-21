@@ -74,7 +74,7 @@ func (a *app) run(sigChan chan os.Signal, lcfg zap.Config) {
 				produceTrigger = time.After(a.nextLogCmdPeriod())
 			case msg := <-a.nc.LogCmds:
 				// log and count. Dump message to stdout.
-				a.lg.Infow("logCmd Rxed", "cmd", string(msg), "order", count)
+				a.lg.Debugw("logCmd Rxed", "cmd", string(msg), "order", count)
 				fmt.Println(string(msg))
 				count++
 			}

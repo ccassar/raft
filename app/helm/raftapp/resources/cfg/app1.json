@@ -1,6 +1,6 @@
 {
   "Nodes": ["ra0-raftapp:{{ .Values.service.raft.port }}",":{{ .Values.service.raft.containerPort }}","ra2-raftapp:{{ .Values.service.raft.port }}"],
-  "LogDB": "/tmp/testlogdb",
+  "LogDB": "/pdata/testlogdb",
   "LeaderTimeout": "500ms",
   "LogCmdPeriod": "10s",
   "Metrics" : {

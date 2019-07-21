@@ -1,12 +1,12 @@
 ## Test Application
 
-The source in this application is a simple skeleton showing basic features of the raft package in action.
-Applications running in a cluster will all see a single version of a distributed log and can each contribute
-to that log. The distributed log is dumped to stdout. The dummy messages include the originating node and a
-UUID.
+This application is a simple skeleton showing basic features of the raft package in action.
 
-In order to run one instance in the application cluster, with debug/logging written to file, you might invoke as
-follows:
+Applications running in a cluster will all see a single version of a distributed log dumped to stdout and can each
+contribute to that log. The dummy messages include the originating node and a UUID.
+
+In order to run one instance in the application cluster, with debug/logging written to file, you might invoke the
+application as follows:
 
 ```
 ./app -config=app.json  -localNode=2 -zapFile=/tmp/log -debug
@@ -30,8 +30,7 @@ Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
 By default, application logs to stderr, so redirecting stderr to file achieves the same end as `-zapFile` command line
 option.
 
-To build the docker image, from docker directory simply run the required variant of the following to build and run one
-instance (for any output you want to run the majority of the cluster - e.g. 2 out of 3-node application cluster):
+To build the docker image, from docker directory simply run the following:
 
 ```
 # Replace tag with appropriate tag e.g. `git describe --always --dirty` or stable.
@@ -40,11 +39,16 @@ docker build -t raftapp:<tag> .
 
 ### Helm Deployment of Application Cluster to Kubernetes
 
-If access to a kubernetes cluster is available, you can use the helm chart provided to deploy an application
+If access to a kubernetes cluster is available, you can use the [helm chart provided](helm/raftapp) to deploy an application
 cluster quickly and with little effort. If the prometheus operator is setup, you can monitor the test application
 cluster using the dashboard provided. The simplest way of seeing the test application in action, is to run an application
 cluster in the cloud; for example on Google Kubernetes Engine (GKE), especially if you already have access to a
 kubernetes cluster with helm deployed.
+
+Note:  The helm chart provided is simplistic and runs deployments. It is not a good example of how to deploy an application
+(e.g a single helm chart install of a StatefulSet would probably be more appropriate than the rough and ready 3x single
+replica Deployments with permanent volume claims), but it is sufficient to have the test application up and running with
+dashboard installed for visibility.
 
 ##### GKE Cluster Prerequisites
 
@@ -72,9 +76,11 @@ kubectl port-forward $(kubectl get pod --selector="app=grafana,release=monitorin
 
 ##### Deploying the Test Application on Google Kubernetes Engine
 
-Once the prerequisite cluster setup is in place, build the test app container in [docker](docker) directory locally as
-follows. PROJECT_ID is set to the gcloud project e.g. using `gcloud config get-value project`. Push the docker image
-to [Google Container Registry](https://cloud.google.com/container-registry/).
+Once the prerequisite GKE cluster setup is in place and a project is available, build the test app container in
+[docker](docker) directory locally as follows. PROJECT_ID is set to the gcloud project e.g. using
+`gcloud config get-value project`.
+
+Push the docker image to [Google Container Registry](https://cloud.google.com/container-registry/).
 
 ```
 docker build -t gcr.io/${PROJECT_ID}/raftapp:stable .
@@ -82,9 +88,17 @@ docker push gcr.io/${PROJECT_ID}/raftapp:stable
 ```
 
 Once the image is built and pushed to the registry, in order to run the three node applications cluster, simply run the
-following deployments: `export NODEID=<0,1 or 2> ; helm install raftapp --name ra${NODEID} --set nodeid=${NODEID}`. Do note,
-that we do not currently preserve the data we must in a persistent volume, and as such is not a safe deployment beyond
-serving to illustrate the clustered behaviour.
+following deployments: 
+
+```
+for i in $(seq 0 2); do helm install raftapp --name ra$i --set nodeid=$i; done
+```
+
+To clean up the application cluster:
+
+```
+for i in $(seq 0 2); do helm delete ra$i --purge; done
+```
 
 
 ### Local Container Deployment
