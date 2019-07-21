@@ -30,7 +30,7 @@ const testMetricsBasePort = 9001
 const testMetricNamespace = "raftTest"
 
 // Readonly node ports...
-var constNodes = []string{":8089", ":8090", ":8092"}
+var constNodes = []string{":8088", ":8089", ":8090"}
 
 func TestMakeNode(t *testing.T) {
 
