@@ -67,12 +67,14 @@ Assuming the prometheus operator was deployed named `monitoring` in the `default
 helm install --name monitoring stable/prometheus-operator
 ```
 
-then port-forwarding to the local host on port 8080 can be setup as follows if ingress is not configured (and, by default,
-no ingress is set up for prometheus operator):
+then port-forwarding to the local host can be setup on port 8090 for grafana, and 9090 for prometheus as follows if
+ingress is not configured (and, by default, no ingress is set up for prometheus operator):
 
 ```
-kubectl port-forward $(kubectl get pod --selector="app=grafana,release=monitoring" --output jsonpath='{.items[0].metadata.name}') 8080:3000
+kubectl port-forward service/monitoring-grafana 8090:80
+kubectl port-forward service/monitoring-prometheus-oper-prometheus 9090:9090
 ```
+
 
 ##### Deploying the Test Application on Google Kubernetes Engine
 
@@ -98,6 +100,44 @@ To clean up the application cluster:
 
 ```
 for i in $(seq 0 2); do helm delete ra$i --purge; done
+```
+
+Here are the resource you would see deployed in kubernetes for the running application cluster:
+
+```
+> kubectl get all,servicemonitor,pvc -l=app.kubernetes.io/name=raftapp
+  NAME                               READY   STATUS    RESTARTS   AGE
+  pod/ra0-raftapp-5584f55b79-qpl8z   1/1     Running   0          6m23s
+  pod/ra1-raftapp-8f46578d8-frd65    1/1     Running   0          6m20s
+  pod/ra2-raftapp-5c7bd956b9-kdpk4   1/1     Running   0          6m17s
+  
+  
+  NAME                  TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)               AGE
+  service/ra0-raftapp   ClusterIP   10.117.7.153   <none>        10043/TCP,10042/TCP   6m24s
+  service/ra1-raftapp   ClusterIP   10.117.12.92   <none>        10043/TCP,10042/TCP   6m21s
+  service/ra2-raftapp   ClusterIP   10.117.14.27   <none>        10043/TCP,10042/TCP   6m18s
+  
+  
+  NAME                          DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGE
+  deployment.apps/ra0-raftapp   1         1         1            1           6m24s
+  deployment.apps/ra1-raftapp   1         1         1            1           6m21s
+  deployment.apps/ra2-raftapp   1         1         1            1           6m18s
+  
+  NAME                                     DESIRED   CURRENT   READY   AGE
+  replicaset.apps/ra0-raftapp-5584f55b79   1         1         1       6m25s
+  replicaset.apps/ra1-raftapp-8f46578d8    1         1         1       6m22s
+  replicaset.apps/ra2-raftapp-5c7bd956b9   1         1         1       6m19s
+  
+  NAME                                               AGE
+  servicemonitor.monitoring.coreos.com/ra0-raftapp   6m
+  servicemonitor.monitoring.coreos.com/ra1-raftapp   6m
+  servicemonitor.monitoring.coreos.com/ra2-raftapp   6m
+  
+  NAME                                STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+  persistentvolumeclaim/ra0-raftapp   Bound    pvc-c03f079f-abc3-11e9-a857-42010a80021c   2Gi        RWO            standard       6m26s
+  persistentvolumeclaim/ra1-raftapp   Bound    pvc-c225cebc-abc3-11e9-a857-42010a80021c   2Gi        RWO            standard       6m23s
+  persistentvolumeclaim/ra2-raftapp   Bound    pvc-c41cd913-abc3-11e9-a857-42010a80021c   2Gi        RWO            standard       6m20s
+
 ```
 
 

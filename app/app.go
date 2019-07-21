@@ -67,7 +67,7 @@ func (a *app) run(sigChan chan os.Signal, lcfg zap.Config) {
 				a.lg.Infow("logCmd Txed", "cmd", string(msg))
 				err = node.LogProduce(ctxWithTimeout, msg)
 				if err != nil {
-					a.lg.Infow("logCmd Txed, failed", "cmd", string(msg), "err", err)
+					a.lg.Debugw("logCmd Txed, failed", "cmd", string(msg), "err", err)
 				}
 				cancelMsg()
 				// rearm the log producer
