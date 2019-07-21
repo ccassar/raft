@@ -1,0 +1,22 @@
+{{- if .Values.monitoring.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "raftapp.fullname" . }}
+  labels:
+    release: {{ .Values.monitoring.scrapeLabel }}
+{{ include "raftapp.labels" . | indent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "raftapp.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+  jobLabel:  {{ .Release.Name }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.monitoring.path }}
+      interval: {{ .Values.monitoring.period }}
+{{- end -}}

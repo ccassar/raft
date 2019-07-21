@@ -8,24 +8,38 @@
 Yet another implementation of raft, in go.
 
 This raft package may be useful to any application run as a cluster of coordinating instances requiring a distributed
-replicated log of events. An identical sequence of events will be exposed to each member instance. Each member instance
-can contribute to that sequence. No third party system is required.
+replicated log of events. An identical sequence of events will be presented to each member instance. Each member instance
+can contribute to that distributed log. No third party system is required.
 
 Member instances can use the replicated log to drive a deterministic state machine: the result would be that all
 instances will arrive at the same state traversing the same sequence of states.
 
-The best (and only) place to start if you are planning to use this package is [package documentation here](https://godoc.org/github.com/ccassar/raft).
+The best (and only) place to start if you are planning to embed this package in your application is the
+[package documentation here](https://godoc.org/github.com/ccassar/raft).
+
 Extensive examples are included, including how to setup TLS with mutual authentication to protect gRPC intra-cluster
 communication. The rest of this README.md is largely about the implementation of the package itself.
 
+A [helm chart is also provided](https://github.com/ccassar/raft/blob/logreplication/app/README.md#helm-deployment-of-application-cluster-to-kubernetes)
+to facilitate deploying a demonstration application cluster on Kubernetes (e.g. on Google Kubernetes Engine in Google
+Cloud). This demo application includes metric export and [grafana dashboard](app/helm/raftapp/resources/dashboards/)
+and can be deployed using a single `helm install` invocation.
+
 The focus of this implementation is an all-batteries-included, production quality, extensively tested, complete
-implementation.
+implementation of the core Raft specification. The list of Raft enhancements which are still pending is as follows:
+graceful leader shutdown, cluster membership extensions for dynamic membership, log compaction, exactly-once guarantees
+for clients and, beyond Raft, Tangaroa extensions. Report card section below includes details of enhancements.
 
 Intra-cluster connectivity is implemented over gRPC with support for TLS protection with mutual authentication.
 
 Observability is central to a production-quality implementation; structured logging (using Uber zap library)
 and metrics export (using prometheus library and gRPC interceptors for both metrics and logging) are an integral
-part of the implementation.
+part of the implementation. The basic dashboard below is include in the helm chart and shows the state of each
+node in the application cluster; follower, candidate or leader role, who is leader (and how leadership changed)
+from the perspective of each node, what is the term, committed and applied index at each node.
+
+![Raft Package Overview](resources/raftOverviewDashboardL.png)
+
 
 Unit test coverage is high and it is a goal to keep it so; unit test code itself is a key component of the
 implementation.
@@ -33,7 +47,7 @@ implementation.
 
 ### Test Application
 
-The source in [`app`](app/README.md) application is a simple skeleton demonstration showing simple features of the raft
+The source in [`app`](app/README.md) application is a skeleton demonstration showing simple features of the raft
 package in action. Test Application instances running in a cluster will all see a single version of a distributed log
 and each contribute random log commands to that log. Each command is made up of an originating node and a UUID.
 
@@ -49,9 +63,11 @@ Node1:00bdafa3-30d4-4be8-bb06-3472927ad00a
 Node0:3c732fc7-a31e-4a8d-8a01-c8199df058fd
 ```
 
-A simple multistage Dockerfile [is provided](app/docker/Dockerfile), together with a helm chart to enable deployment of
-the application cluster as a kubernetes deployment are provided. Instructions are also included for application cluster
-deployment in a cloud environment (specifically on Google Kubernetes Engine).
+A simple multistage Dockerfile [is provided](app/docker/Dockerfile), together with a [helm chart](app/helm/raftapp) to
+enable deployment of the application cluster as kubernetes deployments are provided.
+
+[Instructions are also included](https://github.com/ccassar/raft/blob/master/app/README.md#helm-deployment-of-application-cluster-to-kubernetes)
+for application cluster deployment in a cloud environment (e.g. Google Kubernetes Engine).
 
 
 ### Intracluster Messaging
@@ -163,32 +179,27 @@ Lots to go, but do come inside and have a look.
 
 Completed so far:
 
- - General package infra: gRPC client and server setup, logging, metrics, UT
- - Leadership election
- - Log replication
- - basic metrics export
+ - General package infra: gRPC client and server setup, logging, metrics, UT.
+ - Core Raft Implementation (i.e. leadership election and log replication).
+ - Basic metrics export, and comprehensive structures logging.
+ - Basic helm deployment of demo test application for experimentation.
 
 Todo next:
 
- - prometheus scraping service monitor
- - dashboard, and dump some images
- - doc
- - maybe persistent volume(?)
+Target is to, eventually, cover all of Raft functionality including cluster membership extensions, log compaction,
+exactly-once guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
 
  - election: performance and negative testing; more functional testing around recovery
  - graceful handover on leader before shutdown
  - refactor TestLogReplication()
  - errors/utilisation/saturation metrics
- - deploy with helm chart and prometheus grafana dashboard on gke, and docker compose based example for those running
-   locally
+ - add dashboard to cover gRPC metrics, and add configmap to deploy dashboard automatically using the approach described
+   [here](https://github.com/helm/charts/tree/master/stable/grafana#sidecar-for-dashboards).
+ - docker compose based example for those running locally
  - add config exchange as part of voting protocol to protect/detect misconfiguration (duplicate node ids, sufficiently
    mismatched pre-jittered election timeouts etc)
  - set up an anti-affinity example in the helm deployment as an example of how to avoid application cluster nodes
    being serviced by the same underlying kubernetes node
-
-
-Target is to, eventually, cover all of Raft including cluster membership extensions, log compaction, exactly-once
-guarantees to clients and, beyond Raft, to bring Byzantine fault tolerance via Tangaroa.
 
 
 ### Dependencies

@@ -6,6 +6,6 @@
   "Metrics" : {
     "Endpoint": ":{{ .Values.service.metrics.containerPort }}",
     "Namespace": "raftapp",
-    "Path":"/metrics"
+    "Path":"{{ .Values.monitoring.path }}"
   }
 }

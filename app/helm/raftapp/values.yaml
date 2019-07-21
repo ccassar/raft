@@ -7,7 +7,8 @@ replicaCount: 1
 image:
   repository: gcr.io/raft-246307/raftapp
   tag: stable
-  pullPolicy: IfNotPresent
+  # pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 imagePullSecrets: []
 nameOverride: ""
@@ -26,6 +27,11 @@ service:
     port: 10043
     containerPort: 9043
 
+monitoring:
+  enabled: true
+  path: /metrics
+  period: 5s
+  scrapeLabel: monitoring
 
 ingress:
   enabled: false
