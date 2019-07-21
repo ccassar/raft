@@ -216,7 +216,7 @@ func TestLogReplication(t *testing.T) {
 	}
 
 	n := make([]*testNode, nodeCount)
-	nodes := []string{":8088", ":8089", ":8090"}
+	nodes := constNodes
 	var err error
 
 	for i := 0; i < len(nodes); i++ {
